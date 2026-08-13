@@ -52,7 +52,7 @@ When a fork URL is already recorded, re-running `init` without `--fork-url` pres
 Passing `--fork-url` again replaces the stored fork URL after validation.
 If you rename or move an initialized working directory and the old path no longer exists, re-running `init` from the new path reattaches the existing gate, preserves the repo ID and run history, and updates the stored working path.
 If you copy an initialized working directory while the original still exists, the copy is treated as a separate repo and gets a fresh gate.
-Fresh init rolls back gate setup when a required gate or daemon step fails; refresh does not eject a pre-existing gate if daemon startup fails.
+Fresh init rolls back gate provisioning when a required gate step fails. If the daemon then fails to start, init leaves the freshly created gate in place instead of ejecting it: eject no longer deletes anything, and re-running init repairs and reuses the same gate.
 Skill installation is best-effort: if the skill write fails, init reports it and leaves the working gate in place.
 
 ## no-mistakes axi
@@ -271,14 +271,14 @@ That cancels the pipeline's in-flight work and forces a full re-validation; use 
 
 ## no-mistakes eject
 
-Remove the gate from the current repository.
+Report gate removal information for the current repository.
 
 ```sh
 no-mistakes eject
 ```
 
-Removes the `no-mistakes` remote, deletes the bare repo directory, cleans up worktrees, and deletes the database record (cascades to runs and steps).
-It does not remove any legacy repo-local agent skill files left by older versions; current `init` installs the skill at user level instead.
+Git remains the sole custody authority for no-mistakes, so this command never deletes anything.
+It reports the gate's on-disk paths and database record, and prints the manual `git remote remove` / `rm -rf` steps to remove them yourself.
 
 ## no-mistakes attach
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/gate"
 	"github.com/kunchenguid/no-mistakes/internal/git"
@@ -65,6 +66,11 @@ type RunManager struct {
 // never exceed activeRuns × maxSubscribersPerRun × mailboxMaxBytes. Refusing
 // past the cap is an ordinary error, never unbounded growth.
 const maxSubscribersPerRun = 32
+
+// retireMergedHoldsLimit bounds how many merged custody holds a single push
+// notification retires, so one push notification never blocks on unbounded
+// prior debt (see custody.RetireMergedHolds).
+const retireMergedHoldsLimit = 50
 
 // NewRunManager creates a RunManager. Pass nil for stepFactory to use default steps.
 func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *RunManager {
@@ -322,7 +328,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 			cancel(nil)
 			_ = plan.agent.Close()
 			m.closeSubscribers(plan.run.ID)
-			if err := git.WorktreeRemove(context.Background(), plan.gateDir, plan.workDir); err != nil {
+			if err := custody.AnchorAndRemoveRunWorktree(context.Background(), plan.gateDir, plan.workDir, plan.run.ID); err != nil {
 				slog.Warn("failed to remove recovered worktree", "path", plan.workDir, "error", err)
 			}
 			m.mu.Lock()
@@ -598,6 +604,16 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 	}
 
 	branch := branchFromRef(params.Ref)
+
+	// Best-effort release of custody holds this push's tip now supersedes.
+	// Never fails the push notification itself: a failed or short retirement
+	// just leaves holds for the next qualifying push to retry.
+	if retired, retireErr := custody.RetireMergedHolds(ctx, params.Gate, params.Ref, params.New, retireMergedHoldsLimit); retireErr != nil {
+		slog.Warn("failed to retire merged custody holds", "gate", params.Gate, "ref", params.Ref, "error", retireErr)
+	} else if retired > 0 {
+		slog.Info("retired merged custody holds", "gate", params.Gate, "ref", params.Ref, "count", retired)
+	}
+
 	return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent)
 }
 
@@ -792,7 +808,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 	bgOwnsWorktree := false
 	defer func() {
 		if !bgOwnsWorktree {
-			if rmErr := git.WorktreeRemove(context.Background(), gateDir, wtDir); rmErr != nil {
+			if rmErr := custody.AnchorAndRemoveRunWorktree(context.Background(), gateDir, wtDir, run.ID); rmErr != nil {
 				slog.Warn("failed to remove worktree during setup cleanup", "path", wtDir, "error", rmErr)
 			}
 		}
@@ -951,7 +967,7 @@ func (m *RunManager) startRunWithIntentSource(ctx context.Context, repo *db.Repo
 			// Close subscriber channels for this run.
 			m.closeSubscribers(run.ID)
 			// Clean up worktree.
-			if rmErr := git.WorktreeRemove(context.Background(), gateDir, wtDir); rmErr != nil {
+			if rmErr := custody.AnchorAndRemoveRunWorktree(context.Background(), gateDir, wtDir, run.ID); rmErr != nil {
 				slog.Warn("failed to remove worktree", "path", wtDir, "error", rmErr)
 			}
 			// Remove tracking.
