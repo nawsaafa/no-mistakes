@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -176,6 +177,26 @@ func TestExtractCodexOutputSchemaPath(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := extractCodexOutputSchema(tc.args); got != tc.want {
 				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadCodexPromptReadsStdinMarkerForFreshAndResumedRuns(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "fresh", args: []string{"exec", "-", "--json"}},
+		{name: "resumed", args: []string{"exec", "resume", "thread-123", "-", "--json"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := readCodexPrompt(tc.args, strings.NewReader("review this diff"))
+			if err != nil {
+				t.Fatalf("readCodexPrompt: %v", err)
+			}
+			if got != "review this diff" {
+				t.Fatalf("prompt = %q, want %q", got, "review this diff")
 			}
 		})
 	}

@@ -246,7 +246,13 @@ func TestInitInSubmoduleRegistersSubmoduleOwnOrigin(t *testing.T) {
 	}
 }
 
-func TestInitRollsBackWhenDaemonStartFails(t *testing.T) {
+// TestInitLeavesGateInPlaceWhenDaemonStartFails proves the current contract
+// (1c4b0ae, "read-only eject"): a failed daemon start after a successful
+// gate.InitWithFork does NOT roll anything back. Init is idempotent and
+// eject no longer deletes anything (see internal/cli/init.go), so the
+// created remote, repo record, and bare gate repo are left in place for a
+// retry to repair and reuse rather than recreate.
+func TestInitLeavesGateInPlaceWhenDaemonStartFails(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows IPC does not use Unix socket path limits")
 	}
@@ -268,25 +274,22 @@ func TestInitRollsBackWhenDaemonStartFails(t *testing.T) {
 	if !strings.Contains(out, "start daemon") {
 		t.Fatalf("init output = %q, want daemon startup failure", out)
 	}
-	if strings.Contains(out, "rollback init:") {
-		t.Fatalf("rollback should succeed cleanly, got wrapped error output: %q", out)
-	}
 	// What this bound proves is that init honored the injected 200ms daemon
 	// start timeout instead of falling back to the 45s production budget
 	// (internal/daemon/selfexec.go daemonStartTimeout). It is deliberately
 	// slack: elapsed covers a whole CLI subprocess - process spawn, git work,
-	// opening the database, and the rollback - which takes over a second on a
-	// machine running the rest of the parallel e2e suite, with nothing having
+	// and opening the database - which takes over a second on a machine
+	// running the rest of the parallel e2e suite, with nothing having
 	// regressed. A run that actually fell back to the production budget is
 	// still nowhere near this.
-	const rollbackBudget = 10 * time.Second
-	if elapsed >= rollbackBudget {
-		t.Fatalf("init rollback should fail fast in tests, took %v (budget %v)", elapsed, rollbackBudget)
+	const failFastBudget = 10 * time.Second
+	if elapsed >= failFastBudget {
+		t.Fatalf("init should fail fast in tests, took %v (budget %v)", elapsed, failFastBudget)
 	}
 
 	ctx := context.Background()
-	if out, err := h.runGit(ctx, h.WorkDir, "remote", "get-url", "no-mistakes"); err == nil {
-		t.Fatalf("no-mistakes remote should be removed after failed init, got %q", out)
+	if _, err := h.runGit(ctx, h.WorkDir, "remote", "get-url", "no-mistakes"); err != nil {
+		t.Fatalf("no-mistakes remote should remain after a failed daemon start (read-only eject: init leaves the gate in place for retry), got err: %v", err)
 	}
 
 	p := paths.WithRoot(badNMHome)
@@ -304,15 +307,15 @@ func TestInitRollsBackWhenDaemonStartFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if repo != nil {
-		t.Fatal("repo record should be removed after failed init")
+	if repo == nil {
+		t.Fatal("repo record should remain after a failed daemon start so a retry can repair and reuse it")
 	}
 
 	entries, err := os.ReadDir(p.ReposDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("expected no bare repos after failed init, found %d", len(entries))
+	if len(entries) != 1 {
+		t.Fatalf("expected the created bare gate repo to remain after a failed daemon start, found %d", len(entries))
 	}
 }
