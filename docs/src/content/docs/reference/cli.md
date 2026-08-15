@@ -335,6 +335,7 @@ no-mistakes sync --check
 no-mistakes sync --yes
 no-mistakes sync --recover
 no-mistakes sync --recover --keep-local
+no-mistakes sync --release-branch
 ```
 
 | Flag           | Type   | Default | Description                                                     |
@@ -343,11 +344,12 @@ no-mistakes sync --recover --keep-local
 | `-y`, `--yes`  | `bool` | `false` | Apply an eligible guarded synchronization without an interactive prompt |
 | `--recover`    | `bool` | `false` | Return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch) |
 | `--keep-local` | `bool` | `false` | With `--recover`: keep the current local head; never touches the worktree |
+| `--release-branch` | `bool` | `false` | Stamp custody returned only when a terminal run's exact gate-head guard proves ordinary recovery unreachable; never moves a worktree or Git ref |
 
-Without `--yes`, apply prints the exact full-SHA plan and requires TTY confirmation; `--recover` prompts the same way before returning custody.
-A non-TTY apply or recovery refuses with a direct `--yes` hint.
-The command uses the same service and safety contract as `no-mistakes axi sync`, including the guarded equivalent advance and custody recovery documented there; it never stashes, rebases, creates a merge commit, switches branches, deletes a branch, or updates an external remote.
-The guarded `--release-branch` escape is exposed only on `no-mistakes axi sync`.
+Without `--yes`, apply prints the exact full-SHA plan and requires TTY confirmation; `--recover` and `--release-branch` prompt the same way before returning custody.
+A non-TTY apply, recovery, or release refuses with a direct `--yes` hint.
+The command uses the same service and safety contract as `no-mistakes axi sync`, including the guarded equivalent advance, custody recovery, and unreachable-custody release documented there; it never stashes, rebases, creates a merge commit, switches branches, deletes a branch, or updates an external remote.
+A refused `--recover` names `no-mistakes sync --release-branch` only after the exact gate-head guard proves ordinary recovery unreachable.
 
 ## no-mistakes status
 

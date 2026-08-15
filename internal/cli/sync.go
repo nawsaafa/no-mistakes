@@ -16,7 +16,7 @@ import (
 var syncInteractive = terminalInteractive
 
 func newSyncCmd() *cobra.Command {
-	var check, yes, recover, keepLocal bool
+	var check, yes, recover, keepLocal, releaseBranch bool
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Safely move the current branch to an exact pipeline-pushed head",
@@ -33,7 +33,9 @@ func newSyncCmd() *cobra.Command {
 			"carry every local change. Unproven divergence refuses. A run cancelled before\n" +
 			"the pipeline changed anything releases the branch by itself (user_owned) and\n" +
 			"makes --recover a no-op. --recover --keep-local keeps the current local head\n" +
-			"instead and never touches the worktree.",
+			"instead and never touches the worktree. When recovery proves its exact gate-head\n" +
+			"guard unreachable, --release-branch can return custody without moving any file\n" +
+			"or Git ref.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if check && yes {
@@ -42,11 +44,17 @@ func newSyncCmd() *cobra.Command {
 			if check && recover {
 				return &exitError{code: 2, err: fmt.Errorf("--check and --recover cannot be used together")}
 			}
+			if releaseBranch && (check || recover || keepLocal) {
+				return &exitError{code: 2, err: fmt.Errorf("--release-branch cannot be combined with --check, --recover, or --keep-local")}
+			}
 			if keepLocal && !recover {
 				return &exitError{code: 2, err: fmt.Errorf("--keep-local requires --recover")}
 			}
 			if recover {
 				return runHumanRecover(cmd, keepLocal, yes)
+			}
+			if releaseBranch {
+				return runHumanRelease(cmd, yes)
 			}
 			return runHumanSync(cmd, check, yes)
 		},
@@ -55,6 +63,7 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "apply an eligible guarded synchronization without prompting")
 	cmd.Flags().BoolVar(&recover, "recover", false, "return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch)")
 	cmd.Flags().BoolVar(&keepLocal, "keep-local", false, "with --recover: keep the current local head; the preserved commits stay anchored and the gate follows the kept head")
+	cmd.Flags().BoolVar(&releaseBranch, "release-branch", false, "release custody only when a terminal run's preserved head provably cannot pass guarded recovery")
 	return cmd
 }
 
@@ -235,6 +244,11 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 	recovered := service.Recover(cmd.Context(), keepLocal)
 	observed = recovered
 	printHumanSyncState(cmd, recovered)
+	if recovered.Safety == "blocked_recover_gate_diverged" {
+		fmt.Fprintln(cmd.OutOrStdout(), "  Ordinary recovery is unreachable at its gate-head guard. Run `no-mistakes rerun`")
+		fmt.Fprintln(cmd.OutOrStdout(), "  to resume validation, or `no-mistakes sync --release-branch` to return custody")
+		fmt.Fprintln(cmd.OutOrStdout(), "  without moving the worktree or any Git ref.")
+	}
 	if recovered.Recovered {
 		if recovered.State == branchsync.StateUserOwned {
 			fmt.Fprintln(cmd.OutOrStdout(), "  Nothing to recover; cancellation already released this branch to you.")
@@ -246,6 +260,55 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 		} else {
 			result = "noop"
 		}
+		return nil
+	}
+	result = "refused"
+	return &exitError{code: 1}
+}
+
+func runHumanRelease(cmd *cobra.Command, yes bool) error {
+	started := time.Now()
+	var observed branchsync.State
+	result := "error"
+	defer func() { trackSyncAttempt("sync", "human_cli", "release_branch", observed, result, started) }()
+
+	service, closeFn, err := openSyncService()
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+
+	state := service.InspectCached(cmd.Context())
+	observed = state
+	if !yes {
+		printHumanSyncState(cmd, state)
+		if !syncInteractive() {
+			fmt.Fprintln(cmd.OutOrStdout(), "  Non-interactive input cannot confirm this release. Re-run with `no-mistakes sync --release-branch --yes`.")
+			result = "refused"
+			return &exitError{code: 1}
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "  Release is allowed only when guarded recovery proves that the terminal run's")
+		fmt.Fprintln(cmd.OutOrStdout(), "  preserved head is unreachable. It stamps custody returned without moving the")
+		fmt.Fprintln(cmd.OutOrStdout(), "  worktree, a Git ref, or a remote; every other state refuses.")
+		fmt.Fprint(cmd.OutOrStdout(), "  Release custody of this branch? [y/N] ")
+		line, readErr := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+		if readErr != nil && strings.TrimSpace(line) == "" {
+			return readErr
+		}
+		answer := strings.ToLower(strings.TrimSpace(line))
+		if answer != "y" && answer != "yes" {
+			fmt.Fprintln(cmd.OutOrStdout(), "  Cancelled; no files or refs were changed.")
+			result = "cancelled"
+			return nil
+		}
+	}
+
+	released := service.ReleaseUnreachableCustody(cmd.Context())
+	observed = released
+	printHumanSyncState(cmd, released)
+	if released.Released {
+		fmt.Fprintln(cmd.OutOrStdout(), "  Custody released; start a fresh run when ready.")
+		result = "noop"
 		return nil
 	}
 	result = "refused"

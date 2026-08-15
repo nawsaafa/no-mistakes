@@ -1009,6 +1009,65 @@ func TestAxiSyncReleaseBranchReleasesOnlyGateDivergedTerminalCustody(t *testing.
 	}
 }
 
+// TestHumanSyncReleaseBranchEscapesGateDivergedTerminalCustody proves the
+// interactive sync surface exposes the same guarded release as AXI. Recovery
+// must first refuse and name the human command; confirmation then stamps
+// custody returned without moving either Git head.
+func TestHumanSyncReleaseBranchEscapesGateDivergedTerminalCustody(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+
+	out, err := executeCmd("sync", "--recover", "--yes")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("gate-diverged human recover should refuse, got %#v\n%s", err, out)
+	}
+	if !strings.Contains(out, "no-mistakes sync --release-branch") {
+		t.Fatalf("human recovery refusal did not expose guarded release:\n%s", out)
+	}
+
+	previous := syncInteractive
+	syncInteractive = func() bool { return true }
+	t.Cleanup(func() { syncInteractive = previous })
+	cmd := newRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetIn(strings.NewReader("yes\n"))
+	cmd.SetArgs([]string{"sync", "--release-branch"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("interactive release: %v\n%s", err, buf.String())
+	}
+	for _, want := range []string{"Release custody of this branch?", "Custody released"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("release output missing %q:\n%s", want, buf.String())
+		}
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("release moved local HEAD to %s", got)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("release moved gate head to %s", got)
+	}
+
+	p, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	run, err := database.GetRun(f.runID)
+	if err != nil || run == nil {
+		t.Fatalf("reload run: %#v, %v", run, err)
+	}
+	if run.CustodyReturnedAt == nil {
+		t.Fatal("human release did not stamp custody returned")
+	}
+}
+
 func TestAxiSyncReleaseBranchRefusesWhenRecoveryRemainsReachable(t *testing.T) {
 	f := newCLIRecoverFixture(t)
 	out, err := executeCmd("axi", "sync", "--release-branch")
@@ -1168,6 +1227,8 @@ func TestSyncRecoverFlagValidation(t *testing.T) {
 	for _, args := range [][]string{
 		{"sync", "--check", "--recover"},
 		{"sync", "--keep-local"},
+		{"sync", "--check", "--release-branch"},
+		{"sync", "--recover", "--release-branch"},
 		{"axi", "sync", "--check", "--recover"},
 		{"axi", "sync", "--keep-local"},
 		{"axi", "sync", "--check", "--release-branch"},
