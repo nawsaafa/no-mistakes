@@ -59,7 +59,7 @@ func newSyncCmd() *cobra.Command {
 }
 
 func newAxiSyncCmd() *cobra.Command {
-	var check, recover, keepLocal bool
+	var check, recover, keepLocal, releaseBranch bool
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Check or apply guarded current-branch synchronization",
@@ -71,7 +71,9 @@ func newAxiSyncCmd() *cobra.Command {
 			"verified pipeline head with reset semantics.\n" +
 			"--check performs the same fresh read-only plan. Blocked states change nothing.\n" +
 			"--recover performs the guarded custody return offered by\n" +
-			"next_action.code: recover_custody; --keep-local keeps the current local head.",
+			"next_action.code: recover_custody; --keep-local keeps the current local head.\n" +
+			"--release-branch stamps custody returned only after the exact gate-head guard\n" +
+			"proves recovery unreachable; it never moves a worktree or Git ref.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -79,15 +81,19 @@ func newAxiSyncCmd() *cobra.Command {
 			if check && recover {
 				return emitError(cmd, 2, "--check and --recover cannot be used together")
 			}
+			if releaseBranch && (check || recover || keepLocal) {
+				return emitError(cmd, 2, "--release-branch cannot be combined with --check, --recover, or --keep-local")
+			}
 			if keepLocal && !recover {
 				return emitError(cmd, 2, "--keep-local requires --recover")
 			}
-			return runAxiSync(cmd, check, recover, keepLocal)
+			return runAxiSync(cmd, check, recover, keepLocal, releaseBranch)
 		},
 	}
 	cmd.Flags().BoolVar(&check, "check", false, "freshly verify and return the plan without changing HEAD")
 	cmd.Flags().BoolVar(&recover, "recover", false, "return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch)")
 	cmd.Flags().BoolVar(&keepLocal, "keep-local", false, "with --recover: keep the current local head; the preserved commits stay anchored and the gate follows the kept head")
+	cmd.Flags().BoolVar(&releaseBranch, "release-branch", false, "release custody only when a terminal run's preserved head provably cannot pass guarded recovery")
 	return cmd
 }
 
@@ -304,7 +310,7 @@ func humanSyncSummary(state branchsync.State) string {
 	}
 }
 
-func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
+func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, releaseBranch bool) error {
 	started := time.Now()
 	mode := "apply"
 	switch {
@@ -314,6 +320,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 		mode = "recover_keep_local"
 	case recover:
 		mode = "recover"
+	case releaseBranch:
+		mode = "release_branch"
 	}
 	var state branchsync.State
 	result := "error"
@@ -330,6 +338,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 		state = service.Refresh(cmd.Context())
 	case recover:
 		state = service.Recover(cmd.Context(), keepLocal)
+	case releaseBranch:
+		state = service.ReleaseUnreachableCustody(cmd.Context())
 	default:
 		state = service.Apply(cmd.Context())
 	}
@@ -341,8 +351,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 	if state.NextAction != nil {
 		help = append(help, "Run `"+state.NextAction.Command+"`")
 	}
-	if state.Safety == "blocked_pipeline_owned_recoverable" {
-		help = append(help, "Run `no-mistakes rerun` instead to resume validating the preserved pipeline head")
+	for _, alternative := range state.Alternatives {
+		help = append(help, "Alternatively, run `"+alternative.Command+"`")
 	}
 	if len(help) > 0 {
 		fields = append(fields, toON.Field{Key: "help", Value: help})
@@ -351,6 +361,9 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 	successful := syncStateSuccessful(state, check)
 	if recover {
 		successful = state.Recovered
+	}
+	if releaseBranch {
+		successful = state.Released
 	}
 	if successful {
 		if state.Changed {
@@ -414,6 +427,11 @@ func syncStateSuccessful(state branchsync.State, check bool) bool {
 	return check && branchsync.CanApply(state)
 }
 
+type nextActionRow struct {
+	Code    string `toon:"code"`
+	Command string `toon:"command"`
+}
+
 func branchSyncField(state branchsync.State) toON.Field {
 	local := []toON.Field{
 		{Key: "branch", Value: state.Local.Branch},
@@ -451,6 +469,9 @@ func branchSyncField(state branchsync.State) toON.Field {
 	if state.Recovered {
 		fields = append(fields, toON.Field{Key: "recovered", Value: true})
 	}
+	if state.Released {
+		fields = append(fields, toON.Field{Key: "released", Value: true})
+	}
 	fields = append(fields,
 		toON.Field{Key: "local", Value: toON.NewObject(local...)},
 		toON.Field{Key: "pipeline", Value: toON.NewObject(pipeline...)},
@@ -468,6 +489,13 @@ func branchSyncField(state branchsync.State) toON.Field {
 			toON.Field{Key: "code", Value: state.NextAction.Code},
 			toON.Field{Key: "command", Value: state.NextAction.Command},
 		)})
+	}
+	if len(state.Alternatives) > 0 {
+		alternatives := make([]nextActionRow, 0, len(state.Alternatives))
+		for _, action := range state.Alternatives {
+			alternatives = append(alternatives, nextActionRow{Code: action.Code, Command: action.Command})
+		}
+		fields = append(fields, toON.Field{Key: "alternatives", Value: alternatives})
 	}
 	return toON.Field{Key: "branch_sync", Value: toON.NewObject(fields...)}
 }

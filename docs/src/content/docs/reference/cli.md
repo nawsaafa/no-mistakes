@@ -104,6 +104,9 @@ Reattaching to an in-flight run does not require `--intent`.
 Reattachment accepts either the run's immutable submitted head or its current pipeline head, so pipeline-created fix commits do not detach an unchanged submitting worktree.
 When neither identity matches, `axi run` keeps the fresh-run path but refuses a gate push while `branch_sync` says the pipeline still owns the branch.
 That refusal returns the complete structured state and its `continue_active_run` or `recover_custody` next action instead of a raw Git non-fast-forward.
+A fresh run pushes the exact submitted commit to the gate branch, not a mutable `HEAD`.
+When the gate branch already holds a tip that commit does not extend - the ordinary result of rebasing the branch locally between runs - the push replaces that tip only when the submitted commit provably carries every change from the tip observed in that same push, and only with a `--force-with-lease` anchored to that exact observed SHA, so a concurrent or unrelated gate write refuses instead of being discarded.
+Equal and fast-forward pushes stay ordinary non-force pushes, and divergence the proof cannot decide still fails as a plain Git non-fast-forward.
 Reattaching to an in-flight run can proceed while the daemon is already running even if the global config file has become invalid, but starting a fresh run still requires valid global config.
 Starting a fresh run also requires a runnable effective pipeline agent.
 If the configured native agent or ACP runner is unavailable, the run fails before any pipeline step starts instead of reporting command-only validation as a passed gate.
@@ -167,7 +170,7 @@ Each row reports how long the step has been active, the latest meaningful log or
 If no activity arrives for longer than `step_quiet_warning`, `last_activity` is prefixed with `quiet`; this is only a liveness signal and does not cancel the step.
 For older active runs with no recorded activity timestamp, AXI falls back to the step log file modification time.
 Gate summaries and finding descriptions are bounded in this default status view; truncated values disclose their original length, and the gate help points to `no-mistakes axi logs --step <step> --full` for the complete step log.
-Relevant current-branch states also include a cached `branch_sync` object with full SHAs, the run's status, the persisted pipeline push binding, target kind and ref, relation, safety result, PR lifecycle, and a structured next action.
+Relevant current-branch states also include a cached `branch_sync` object with full SHAs, the run's status, the persisted pipeline push binding, target kind and ref, relation, safety result, PR lifecycle, a structured primary next action, and explicit alternatives when more than one guarded exit exists.
 Cached home and status rendering performs no network read and labels the remote observation `pipeline_push`; only explicit sync check or apply reports `live` freshness.
 
 ## no-mistakes axi sync
@@ -179,6 +182,7 @@ no-mistakes axi sync --check
 no-mistakes axi sync
 no-mistakes axi sync --recover
 no-mistakes axi sync --recover --keep-local
+no-mistakes axi sync --release-branch
 ```
 
 | Flag           | Type   | Default | Description                                                                  |
@@ -186,10 +190,11 @@ no-mistakes axi sync --recover --keep-local
 | `--check`      | `bool` | `false` | Verify the live target and exact plan without changing `HEAD`                |
 | `--recover`    | `bool` | `false` | Return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch) |
 | `--keep-local` | `bool` | `false` | With `--recover`: keep the current local head; never touches the worktree   |
+| `--release-branch` | `bool` | `false` | Stamp custody returned only when a terminal run's exact gate-head guard proves ordinary recovery unreachable; never moves a worktree or Git ref |
 
 The default command is an explicit non-interactive apply request and never prompts.
 All modes return the complete `branch_sync` object as TOON.
-Exit code `0` means an eligible check, applied synchronization or recovery, already-synchronized, custody-returned, or user-owned no-op, or expected merged-and-removed no-op; blocked operational states return `1`.
+Exit code `0` means an eligible check, applied synchronization, recovery or guarded branch release, already-synchronized, custody-returned, or user-owned no-op, or expected merged-and-removed no-op; blocked operational states return `1`.
 The ordinary worktree mutation is either a strict fast-forward of the invoking clean checked-out branch to the freshly verified pipeline-owned pushed SHA, or an equivalent-diverged advance.
 When a clean local branch and the pipeline-pushed head are diverged but the local unique work is content-equivalent to work already represented in the live pipeline head, `sync` reports `safety: safe_equivalent_advance`, anchors the pre-sync head under `refs/no-mistakes/sync-anchor/<run>`, and moves to the pipeline head with reset semantics.
 Genuine divergence still reports `safety: blocked_diverged` and changes nothing.
@@ -211,8 +216,11 @@ For behind or diverged worktrees, recovery verifies the preserved head at the lo
 A clean behind worktree fast-forwards.
 A diverged worktree is adopted only when the preserved head provably carries every local change, proven by an executable three-way merge whose result is exactly the preserved head's tree.
 This covers a pipeline rebase onto a newer base once a later pipeline commit has also advanced the gate branch to the preserved head.
-A rebase-only cancelled run can still refuse recovery because its detached worktree advances the recorded run head without advancing that gate branch; use `no-mistakes rerun` in that case.
-That adoption anchors the pre-recovery local head under `refs/no-mistakes/recover-local/<run>`, then moves the branch with Git operations that refuse on their own rather than after a preceding check: an atomic compare-and-swap on the branch ref, and a working-tree update that aborts instead of overwriting a modified or untracked file.
+A rebase-only cancelled run can still refuse recovery because its detached worktree advances the recorded run head without advancing that gate branch.
+That `blocked_recover_gate_diverged` result makes `no-mistakes rerun` the primary structured next action so a fresh run can resume from the gate branch.
+It also offers `release_unreachable_custody` as an explicit alternative: `no-mistakes axi sync --release-branch` verifies that the run is terminal with a verified preserved head, that no local or anchored recovery path remains, and that the readable gate branch differs from that head before calling the idempotent custody-return stamp.
+The release changes no worktree or Git ref and is unavailable for active, unverified, missing-gate, or still-recoverable runs.
+Adopting a diverged preserved head anchors the pre-recovery local head under `refs/no-mistakes/recover-local/<run>`, then moves the branch with Git operations that refuse on their own rather than after a preceding check: an atomic compare-and-swap on the branch ref, and a working-tree update that aborts instead of overwriting a modified or untracked file.
 The proof is deliberately narrow and never uses patch identity, which discards hunk locations and whitespace and so cannot tell a genuine replay from a same-shaped edit elsewhere.
 Anything it cannot decide - unlanded local commits, or a rebase whose fix rounds also rewrote your own lines - still refuses with the anchor named, because only escalation can tell a deliberate pipeline fix apart from a dropped change.
 A dirty worktree refuses with explicit choices.
@@ -339,6 +347,7 @@ no-mistakes sync --recover --keep-local
 Without `--yes`, apply prints the exact full-SHA plan and requires TTY confirmation; `--recover` prompts the same way before returning custody.
 A non-TTY apply or recovery refuses with a direct `--yes` hint.
 The command uses the same service and safety contract as `no-mistakes axi sync`, including the guarded equivalent advance and custody recovery documented there; it never stashes, rebases, creates a merge commit, switches branches, deletes a branch, or updates an external remote.
+The guarded `--release-branch` escape is exposed only on `no-mistakes axi sync`.
 
 ## no-mistakes status
 

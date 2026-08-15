@@ -287,6 +287,48 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 	}
 }
 
+type triggerPushPlan struct {
+	headSHA        string
+	expectedSHA    string
+	forceWithLease bool
+}
+
+// planTriggerPush permits a non-fast-forward gate update only when the local
+// head content-exactly carries every change from the currently observed gate
+// tip. The exact observation becomes the force-with-lease anchor, so any write
+// after this read makes the push fail rather than discarding concurrent work.
+func planTriggerPush(ctx context.Context, dir, remote, ref, headSHA string) (triggerPushPlan, error) {
+	observed, err := git.LsRemote(ctx, dir, remote, ref)
+	if err != nil {
+		return triggerPushPlan{}, fmt.Errorf("observe gate branch %s: %w", ref, err)
+	}
+	plan := triggerPushPlan{headSHA: headSHA}
+	if observed == "" || observed == headSHA {
+		return plan, nil
+	}
+	if _, err := git.Run(ctx, dir, "merge-base", "--is-ancestor", observed, headSHA); err == nil {
+		return plan, nil
+	}
+	if !branchsync.ContainsAllChanges(ctx, dir, observed, headSHA) {
+		return plan, nil
+	}
+	plan.expectedSHA = observed
+	plan.forceWithLease = true
+	return plan, nil
+}
+
+func executeTriggerPush(ctx context.Context, dir, remote, ref string, plan triggerPushPlan, pushOptions []string) error {
+	return git.PushCommitWithOptions(ctx, dir, remote, plan.headSHA, ref, plan.expectedSHA, plan.forceWithLease, pushOptions)
+}
+
+func pushTriggerHead(ctx context.Context, dir, remote, ref, headSHA string, pushOptions []string) error {
+	plan, err := planTriggerPush(ctx, dir, remote, ref, headSHA)
+	if err != nil {
+		return err
+	}
+	return executeTriggerPush(ctx, dir, remote, ref, plan, pushOptions)
+}
+
 // triggerRun starts a fresh run for branch: it pushes the current HEAD through
 // the gate to trigger a pipeline, and falls back to a rerun when the push was a
 // no-op (the gate already had this commit). Callers must check for an existing
@@ -305,7 +347,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 	if state := freshRunBranchOwnershipState(ctx, env); state != nil {
 		return "", &branchOwnershipError{state: *state}
 	}
-	pushErr := git.PushWithOptions(ctx, ".", gate.RemoteName, "refs/heads/"+branch, "", false, pushOptions)
+	pushErr := pushTriggerHead(ctx, ".", gate.RemoteName, "refs/heads/"+branch, headSHA, pushOptions)
 	if pushErr != nil {
 		// Close the inspection-to-push race: if the pipeline advanced ownership
 		// after the pre-push check, preserve the structured branch-sync refusal

@@ -44,6 +44,10 @@ var canonicalBranchSyncPhrases = []string{
 	"recover_custody",
 	"no-mistakes axi sync --recover",
 	"preserved in the local gate",
+	"alternatives",
+	"release_unreachable_custody",
+	"no-mistakes axi sync --release-branch",
+	"without moving a worktree or Git ref",
 	// Cancellation releases a run that never changed the submitted head
 	// (v1.44.2 dogfood catch): every surface must name the released state and
 	// that it needs no recovery.

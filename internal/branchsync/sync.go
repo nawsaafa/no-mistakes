@@ -77,9 +77,13 @@ type State struct {
 	// returned (by this call or an earlier, idempotent one), or the terminal
 	// outcome had already released the branch (user_owned), making recovery an
 	// idempotent no-op.
-	Recovered  bool
-	NextAction *NextAction
-	Error      string
+	Recovered bool
+	// Released is set only when guarded unreachable-custody release succeeded
+	// or found its idempotent custody stamp already present.
+	Released     bool
+	NextAction   *NextAction
+	Alternatives []NextAction
+	Error        string
 }
 
 type LocalState struct {
@@ -588,7 +592,10 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	// the preserved head is already anchored.
 	resumedKeepLocal := keepLocal && anchored && gateHead == local
 	if gateHead != preserved && !resumedKeepLocal {
-		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_diverged", fmt.Sprintf("the gate branch is at %s, not the preserved pipeline head %s recorded for this run; no files or refs were changed", gateHead, preserved))
+		blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_diverged", fmt.Sprintf("the gate branch is at %s, not the preserved pipeline head %s recorded for this run; no files or refs were changed", gateHead, preserved))
+		blocked.NextAction = &NextAction{Code: "rerun_pipeline", Command: "no-mistakes rerun"}
+		blocked.Alternatives = []NextAction{{Code: "release_unreachable_custody", Command: "no-mistakes axi sync --release-branch"}}
+		return blocked
 	}
 	if !anchored {
 		if fetchErr := git.FetchRemoteBranchToPrivateRef(ctx, wd, gateDir, branch, anchorRef); fetchErr != nil {
@@ -633,6 +640,71 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		blocked.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "git log --oneline --left-right HEAD..." + anchorRef}
 		return blocked
 	}
+}
+
+// ReleaseUnreachableCustody returns branch ownership by stamping the existing
+// custody-return marker only when ordinary recovery is proven unreachable at
+// its exact gate-head guard. It never moves a worktree or Git ref, and refuses
+// active, unverified, missing-gate, and still-recoverable cases.
+func (s *Service) ReleaseUnreachableCustody(ctx context.Context) State {
+	if refusal, blocked := s.gateContextRefusal(ctx); blocked {
+		return refusal
+	}
+	state, run, _ := s.inspect(ctx)
+	if run != nil && run.CustodyReturnedAt != nil {
+		state.Released = true
+		return state
+	}
+	if state.State != StatePipelineOwned || run == nil {
+		return blockedPlan(state, state.State, "blocked_release_not_applicable", "branch release is available only for custody held by a terminal run with unreachable recovery; no files or refs were changed")
+	}
+	if !terminalRunStatus(run.Status) {
+		return blockedPlan(state, StatePipelineOwned, "blocked_release_run_active", "the run that owns this branch is still active; it cannot be released; no files or refs were changed")
+	}
+	if run.TerminalHeadVerifiedAt == nil {
+		return blockedPlan(state, StatePipelineOwned, "blocked_release_unverified_head", "the terminal run has no verified preserved head, so unreachable recovery cannot be proven; no files or refs were changed")
+	}
+
+	wd := s.workDir()
+	local := state.Local.Head
+	preserved := run.HeadSHA
+	if objectExists(ctx, wd, preserved) && (local == preserved || isAncestor(ctx, wd, preserved, local)) {
+		blocked := blockedPlan(state, StatePipelineOwned, "blocked_release_recovery_available", "the preserved pipeline head is reachable from the invoking worktree; use guarded recovery instead of releasing it; no files or refs were changed")
+		blocked.NextAction = &NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover"}
+		return blocked
+	}
+
+	gateDir := strings.TrimSpace(s.GateDir)
+	if gateDir == "" {
+		return blockedPlan(state, StatePipelineOwned, "blocked_release_gate_unavailable", "no local gate is configured, so gate divergence and unreachable recovery cannot be proven; no files or refs were changed")
+	}
+	branch := state.Local.Branch
+	gateHead, err := git.Run(ctx, gateDir, "rev-parse", "refs/heads/"+branch+"^{commit}")
+	if err != nil {
+		return blockedPlan(state, StatePipelineOwned, "blocked_release_gate_unavailable", "the local gate branch could not be read, so gate divergence and unreachable recovery cannot be proven; no files or refs were changed")
+	}
+	anchorRef := recoverAnchorRef(run.ID)
+	anchored := false
+	if existing, anchorErr := git.Run(ctx, wd, "rev-parse", anchorRef+"^{commit}"); anchorErr == nil && existing == preserved {
+		anchored = true
+	}
+	if gateHead == preserved || (anchored && gateHead == local) {
+		command := "no-mistakes axi sync --recover"
+		if anchored && gateHead == local && gateHead != preserved {
+			command += " --keep-local"
+		}
+		blocked := blockedPlan(state, StatePipelineOwned, "blocked_release_recovery_available", "the gate and local recovery anchor still satisfy a guarded recovery path; recover instead of releasing it; no files or refs were changed")
+		blocked.NextAction = &NextAction{Code: "recover_custody", Command: command}
+		return blocked
+	}
+
+	if err := s.DB.SetRunCustodyReturned(run.ID); err != nil {
+		return blockedPlan(state, StatePipelineOwned, "blocked_release_persist_failed", "the custody-return marker could not be persisted; branch ownership was not released")
+	}
+	released := s.InspectCached(ctx)
+	released.Released = true
+	released.Changed = false
+	return released
 }
 
 // recoverKeepLocal performs the explicit keep-local custody return: the
@@ -744,6 +816,12 @@ func preservedContainsLocalWork(ctx context.Context, dir, local, preserved strin
 		return false
 	}
 	return mergeTreePreservesFinalHead(ctx, dir, base, local, preserved)
+}
+
+// ContainsAllChanges exposes the content-exact custody containment proof for
+// another guarded gate-ref transition.
+func ContainsAllChanges(ctx context.Context, dir, source, candidate string) bool {
+	return preservedContainsLocalWork(ctx, dir, source, candidate)
 }
 
 // recoverAdoptPreserved returns custody for a preserved pipeline head that
@@ -1339,6 +1417,7 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 		state.Safety = "blocked_pipeline_owned_recoverable"
 		state.Error = "the run finished " + string(run.Status) + " with unpublished pipeline commits preserved in the local gate; recover custody before any local follow-up commit"
 		state.NextAction = &NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover"}
+		state.Alternatives = []NextAction{{Code: "rerun_pipeline", Command: "no-mistakes rerun"}}
 		return
 	}
 	state.Safety = "blocked_pipeline_owned"
@@ -1481,6 +1560,7 @@ func blockedPlan(state State, resultState, safety, message string) State {
 	state.Safety = safety
 	state.Changed = false
 	state.NextAction = nil
+	state.Alternatives = nil
 	state.Error = message
 	return state
 }

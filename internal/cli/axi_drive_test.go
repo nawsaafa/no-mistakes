@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -30,6 +31,119 @@ func ciRunView(ciStatus types.StepStatus) runView {
 			{Name: string(types.StepCI), Status: string(ciStatus)},
 		},
 	}
+}
+
+// TestTriggerPushContentPreservingRebaseUsesExactLease reproduces the normal
+// AXI trigger's pre-daemon failure: a content-preserving local rebase is not a
+// fast-forward of the gate branch. The trigger may replace that exact observed
+// tip, but a write that lands after observation must make the same push fail.
+func TestTriggerPushContentPreservingRebaseUsesExactLease(t *testing.T) {
+	t.Run("content-preserving rebase", func(t *testing.T) {
+		local, gate, oldHead, rebasedHead := newTriggerRebaseFixture(t)
+		ref := "refs/heads/feature/rebase"
+
+		plan, err := planTriggerPush(context.Background(), local, "gate", ref, rebasedHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plan.forceWithLease || plan.expectedSHA != oldHead {
+			t.Fatalf("rebase push plan = %#v, want exact lease at %s", plan, oldHead)
+		}
+		// The selected commit is immutable: even a HEAD move between planning
+		// and execution cannot replace the content whose containment was proven.
+		cliGit(t, local, "checkout", "main")
+		if err := executeTriggerPush(context.Background(), local, "gate", ref, plan, nil); err != nil {
+			t.Fatalf("content-preserving rebase push: %v", err)
+		}
+		if got := cliGit(t, gate, "rev-parse", ref); got != rebasedHead {
+			t.Fatalf("gate head = %s, want rebased %s", got, rebasedHead)
+		}
+	})
+
+	t.Run("concurrent gate write rejects stale lease", func(t *testing.T) {
+		local, gate, oldHead, rebasedHead := newTriggerRebaseFixture(t)
+		ref := "refs/heads/feature/rebase"
+		plan, err := planTriggerPush(context.Background(), local, "gate", ref, rebasedHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plan.forceWithLease || plan.expectedSHA != oldHead {
+			t.Fatalf("rebase push plan = %#v, want exact lease at %s", plan, oldHead)
+		}
+
+		writer := filepath.Join(t.TempDir(), "writer")
+		cliGit(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", gate, writer)
+		cliGit(t, writer, "config", "user.name", "Concurrent Writer")
+		cliGit(t, writer, "config", "user.email", "writer@example.com")
+		cliGit(t, writer, "checkout", "feature/rebase")
+		if err := os.WriteFile(filepath.Join(writer, "concurrent.txt"), []byte("concurrent\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cliGit(t, writer, "add", "concurrent.txt")
+		cliGit(t, writer, "commit", "-m", "concurrent gate write")
+		concurrentHead := cliGit(t, writer, "rev-parse", "HEAD")
+		cliGit(t, writer, "push", "origin", "HEAD:"+ref)
+
+		if err := executeTriggerPush(context.Background(), local, "gate", ref, plan, nil); err == nil {
+			t.Fatal("stale rebase lease unexpectedly overwrote a concurrent gate write")
+		}
+		if got := cliGit(t, gate, "rev-parse", ref); got != concurrentHead {
+			t.Fatalf("gate head = %s, want concurrent %s", got, concurrentHead)
+		}
+	})
+
+	t.Run("unrelated rewrite stays non-force", func(t *testing.T) {
+		local, _, _, _ := newTriggerRebaseFixture(t)
+		ref := "refs/heads/feature/rebase"
+		cliGit(t, local, "checkout", "main")
+		unrelatedHead := cliGit(t, local, "rev-parse", "HEAD")
+		plan, err := planTriggerPush(context.Background(), local, "gate", ref, unrelatedHead)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.forceWithLease {
+			t.Fatalf("unrelated rewrite received force plan: %#v", plan)
+		}
+		if err := executeTriggerPush(context.Background(), local, "gate", ref, plan, nil); err == nil {
+			t.Fatal("unrelated non-fast-forward rewrite unexpectedly succeeded")
+		}
+	})
+}
+
+func newTriggerRebaseFixture(t *testing.T) (local, gate, oldHead, rebasedHead string) {
+	t.Helper()
+	root := t.TempDir()
+	gate = filepath.Join(root, "gate.git")
+	cliGit(t, root, "init", "--bare", gate)
+	local = filepath.Join(root, "operator")
+	cliGit(t, root, "init", "-b", "main", local)
+	cliGit(t, local, "config", "user.name", "Operator")
+	cliGit(t, local, "config", "user.email", "operator@example.com")
+	if err := os.WriteFile(filepath.Join(local, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, local, "add", "base.txt")
+	cliGit(t, local, "commit", "-m", "base")
+	cliGit(t, local, "checkout", "-b", "feature/rebase")
+	if err := os.WriteFile(filepath.Join(local, "feature.txt"), []byte("feature\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, local, "add", "feature.txt")
+	cliGit(t, local, "commit", "-m", "feature")
+	oldHead = cliGit(t, local, "rev-parse", "HEAD")
+	cliGit(t, local, "remote", "add", "gate", gate)
+	cliGit(t, local, "push", "gate", "HEAD:refs/heads/feature/rebase")
+
+	cliGit(t, local, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(local, "main.txt"), []byte("main advanced\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, local, "add", "main.txt")
+	cliGit(t, local, "commit", "-m", "advance main")
+	cliGit(t, local, "checkout", "feature/rebase")
+	cliGit(t, local, "rebase", "main")
+	rebasedHead = cliGit(t, local, "rev-parse", "HEAD")
+	return local, gate, oldHead, rebasedHead
 }
 
 func TestDriveRun_HealthyWaitStaysWithinRequestBudget(t *testing.T) {

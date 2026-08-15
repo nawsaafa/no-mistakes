@@ -174,9 +174,10 @@ no-mistakes axi abort
 no-mistakes axi abort --run <id>
 ```
 
-Before any post-pipeline local commit or fresh run, read `branch_sync`.
+Before any post-pipeline local commit or fresh run, read `branch_sync`, including its primary `next_action` and any explicit `alternatives`.
 Only when its structured `next_action.code` is `sync`, run `no-mistakes axi sync` first.
-When `next_action.code` is `recover_custody` - a terminal run left unpublished pipeline commits preserved in the local gate - run `no-mistakes axi sync --recover` to return custody, or `no-mistakes rerun` to resume validating the preserved head.
+When `next_action.code` is `recover_custody` - a terminal run left unpublished pipeline commits preserved in the local gate - run `no-mistakes axi sync --recover` to return custody, or follow the structured `rerun_pipeline` alternative to resume validating the preserved head.
+Only when a refused recovery explicitly offers `release_unreachable_custody`, run `no-mistakes axi sync --release-branch`; its guard proves recovery unreachable before stamping custody returned without moving a worktree or Git ref.
 A `branch_sync.state` of `user_owned` means the run went terminal before changing the submitted head and cancellation released the branch: it is immediately usable and needs no sync action.
 When `next_action.code` is `continue_active_run`, run the reported command and keep driving the active run.
 If synchronization is blocked, process that state instead of improvising reset, stash, merge, rebase, force, or branch replacement.

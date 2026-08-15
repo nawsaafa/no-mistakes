@@ -495,6 +495,9 @@ func TestRecoverGateDivergenceAndUnavailabilityFailClosed(t *testing.T) {
 		if state.Recovered || state.Safety != "blocked_recover_gate_diverged" {
 			t.Fatalf("recover with moved gate = %#v", state)
 		}
+		if state.NextAction == nil || state.NextAction.Code != "rerun_pipeline" || state.NextAction.Command != "no-mistakes rerun" {
+			t.Fatalf("moved-gate next action = %#v, want fresh rerun escape", state.NextAction)
+		}
 		if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
 			t.Fatal("moved-gate refusal mutated HEAD")
 		}
