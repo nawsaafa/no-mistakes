@@ -217,6 +217,29 @@ func ciMergeabilityOutcome(summary, description string) *pipeline.StepOutcome {
 	}
 }
 
+// ciReaderErrorOutcome parks the CI step after streak consecutive failures to
+// read CI status, carrying the last (redacted) reader error as ask-user
+// evidence. Without this, a persistently failing reader can never park: the
+// poll loop just keeps retrying until the (possibly unlimited) CITimeout, so
+// axi respond has no parked step to act on and the run cannot be skipped or
+// closed on honest evidence - only aborted, which records a false step
+// failure instead of the reader error that actually blocked it.
+func ciReaderErrorOutcome(streak int, lastErr string) *pipeline.StepOutcome {
+	findings := Findings{
+		Summary: "CI status could not be read",
+		Items: []Finding{{
+			Severity:    "warning",
+			Description: fmt.Sprintf("could not read CI status after %d consecutive attempts: %s", streak, lastErr),
+			Action:      types.ActionAskUser,
+		}},
+	}
+	findingsJSON, _ := json.Marshal(findings)
+	return &pipeline.StepOutcome{
+		NeedsApproval: true,
+		Findings:      string(findingsJSON),
+	}
+}
+
 func ciMonitoringTimeoutOutcome() *pipeline.StepOutcome {
 	findings := Findings{
 		Summary: "CI monitoring timed out before PR was merged or closed",

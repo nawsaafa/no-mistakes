@@ -10,6 +10,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -17,6 +18,14 @@ import (
 const (
 	defaultBaseBranchTipResolveWindow = 30 * time.Second
 	defaultPublishedHeadResolveWindow = 30 * time.Second
+
+	// ciReaderErrorParkThreshold is the number of consecutive GetChecks read
+	// failures the CI monitor tolerates before parking for a decision. A single
+	// flaky poll is not escalated - the poll loop just retries at the normal
+	// cadence - but a reader that keeps erroring can otherwise stall a run for
+	// its entire (possibly unlimited) CITimeout with no reachable skip, because
+	// the step never parks and axi respond only acts on a parked step.
+	ciReaderErrorParkThreshold = 3
 )
 
 // CI monitoring status messages. These are surfaced to the user and parsed by
@@ -42,6 +51,8 @@ type CIStep struct {
 	ciFixAttempts        int                  // number of CI auto-fix attempts made
 	transientReruns      checkRerunBudget     // per-check rerun budget spent on provider-reported transient failures
 	pollIntervalOverride time.Duration        // if set, overrides computed poll interval (for testing)
+	readerErrorStreak    int                  // consecutive GetChecks failures since the last successful read
+	lastReaderErr        string               // redacted text of the most recent GetChecks failure
 	waitForNextPoll      func(context.Context, time.Duration) error
 	now                  func() time.Time
 	// baseBranchTip resolves the current tip SHA of the upstream default
@@ -303,7 +314,14 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			clearCIMonitorReady(sctx)
 			lastMonitorLog = ""
 			sctx.Log(fmt.Sprintf("warning: could not check CI: %v", err))
+			s.readerErrorStreak++
+			s.lastReaderErr = safeurl.RedactText(err.Error())
+			if s.readerErrorStreak >= ciReaderErrorParkThreshold {
+				return ciReaderErrorOutcome(s.readerErrorStreak, s.lastReaderErr), nil
+			}
 		} else {
+			s.readerErrorStreak = 0
+			s.lastReaderErr = ""
 			// checksPending is the narrow execution state: only checks that are
 			// actively running or queued block a rerun or issue escalation. A
 			// provider-cancelled check is terminal enough to enter the transient

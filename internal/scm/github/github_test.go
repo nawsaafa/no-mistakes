@@ -298,12 +298,15 @@ func TestGetChecksTargetsKnownPRByURLWhenNumberMissing(t *testing.T) {
 	}
 	got := recorded[0]
 	// argv is: gh pr view <selector> --repo ...
-	if len(got) < 4 || got[1] != "pr" || got[2] != "view" {
+	if len(got) < 6 || got[1] != "pr" || got[2] != "view" {
 		t.Fatalf("unexpected argv: %v", got)
 	}
 	selector := got[3]
 	if selector != prURL {
 		t.Fatalf("check selector = %q, want the known PR URL %q (empty selector makes gh resolve the cwd branch)", selector, prURL)
+	}
+	if got[4] != "--repo" || got[5] != "test/repo" {
+		t.Fatalf("check repository scope = %v, want --repo test/repo", got)
 	}
 }
 
@@ -358,8 +361,11 @@ func TestPRStateAndMergeableTargetKnownPRByURL(t *testing.T) {
 	if _, err := stateHost.GetPRState(context.Background(), &scm.PR{URL: prURL}); err != nil {
 		t.Fatalf("GetPRState() error = %v", err)
 	}
-	if len(stateArgs) != 1 || len(stateArgs[0]) < 4 || stateArgs[0][3] != prURL {
+	if len(stateArgs) != 1 || len(stateArgs[0]) < 6 || stateArgs[0][3] != prURL {
 		t.Fatalf("GetPRState selector = %v, want %q at argv[3]", stateArgs, prURL)
+	}
+	if stateArgs[0][4] != "--repo" || stateArgs[0][5] != "test/repo" {
+		t.Fatalf("GetPRState repository scope = %v, want --repo test/repo", stateArgs)
 	}
 
 	var mergeArgs [][]string
@@ -367,8 +373,11 @@ func TestPRStateAndMergeableTargetKnownPRByURL(t *testing.T) {
 	if _, err := mergeHost.GetMergeableState(context.Background(), &scm.PR{URL: prURL}); err != nil {
 		t.Fatalf("GetMergeableState() error = %v", err)
 	}
-	if len(mergeArgs) != 1 || len(mergeArgs[0]) < 4 || mergeArgs[0][3] != prURL {
+	if len(mergeArgs) != 1 || len(mergeArgs[0]) < 6 || mergeArgs[0][3] != prURL {
 		t.Fatalf("GetMergeableState selector = %v, want %q at argv[3]", mergeArgs, prURL)
+	}
+	if mergeArgs[0][4] != "--repo" || mergeArgs[0][5] != "test/repo" {
+		t.Fatalf("GetMergeableState repository scope = %v, want --repo test/repo", mergeArgs)
 	}
 }
 
