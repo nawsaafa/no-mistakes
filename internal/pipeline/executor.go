@@ -57,10 +57,12 @@ type Executor struct {
 	shared   *RunShared
 	workDir  string
 
-	mu          sync.Mutex
-	approvalCh  chan approvalResponse // buffered channel for approval responses
-	waiting     bool                  // true when blocked on approval
-	waitingStep types.StepName        // which step is currently awaiting approval
+	mu              sync.Mutex
+	approvalCh      chan approvalResponse // buffered channel for approval responses
+	waiting         bool                  // true when blocked on approval
+	waitingStep     types.StepName        // which step is currently awaiting approval
+	waitingFindings string                // immutable findings payload for the current gate
+	waitingRunID    string                // run containing the current gate
 
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
@@ -129,6 +131,12 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 		e.mu.Unlock()
 		return fmt.Errorf("step mismatch: responding to %q but %q is awaiting approval", step, e.waitingStep)
 	}
+	if action == types.ActionFix {
+		if err := e.validateFindingSelection(e.waitingRunID, e.waitingStep, e.waitingFindings, findingIDs); err != nil {
+			e.mu.Unlock()
+			return err
+		}
+	}
 	e.waiting = false
 	e.mu.Unlock()
 
@@ -139,6 +147,60 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 		addedFindings: addedFindings,
 	}
 	return nil
+}
+
+// validateFindingSelection refuses a fix selection that names an ID outside
+// the current approval gate. Keeping the gate open means its instructions and
+// added findings cannot be applied independently from the rejected selection.
+func (e *Executor) validateFindingSelection(runID string, step types.StepName, raw string, ids []string) error {
+	missing, err := unresolvedFindingIDs(raw, ids)
+	if err != nil {
+		return fmt.Errorf("validate selected finding IDs for awaiting %s step: %w", step, err)
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+
+	owners := e.findingOwners(runID, missing)
+	details := make([]string, 0, len(missing))
+	for _, id := range missing {
+		detail := id
+		if owner, ok := owners[id]; ok {
+			detail += fmt.Sprintf(" (belongs to %s step)", owner)
+		}
+		details = append(details, detail)
+	}
+	return fmt.Errorf("selected finding IDs do not belong to awaiting %s step: %s", step, strings.Join(details, ", "))
+}
+
+func (e *Executor) findingOwners(runID string, ids []string) map[string]types.StepName {
+	if runID == "" || len(ids) == 0 {
+		return nil
+	}
+	steps, err := e.db.GetStepsByRun(runID)
+	if err != nil {
+		return nil
+	}
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+	owners := make(map[string]types.StepName, len(ids))
+	for _, result := range steps {
+		if result.FindingsJSON == nil {
+			continue
+		}
+		findings, err := types.ParseFindingsJSON(*result.FindingsJSON)
+		if err != nil {
+			continue
+		}
+		for _, item := range findings.Items {
+			if wanted[item.ID] {
+				owners[item.ID] = result.StepName
+			}
+		}
+	}
+	return owners
 }
 
 // Execute runs the pipeline steps sequentially for a given run.
@@ -329,6 +391,8 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	e.mu.Lock()
 	e.waiting = true
 	e.waitingStep = gate.step.Name()
+	e.waitingFindings = gate.findings
+	e.waitingRunID = run.ID
 	e.mu.Unlock()
 	e.emitStepEventWithFindingsAndError(
 		ipc.EventStepCompleted,
@@ -364,9 +428,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	if agentName := e.telemetryAgentName(); agentName != "" {
 		approvalFields["agent"] = agentName
 	}
-	if selectedCount := selectedFindingCount(gate.findings, response.findingIDs); selectedCount > 0 {
-		approvalFields["selected_findings_count"] = selectedCount
-	}
+	setApprovalFindingCount(approvalFields, response.action, gate.findings, response.findingIDs)
 	telemetry.Track("approval", approvalFields)
 	switch response.action {
 	case types.ActionApprove:
@@ -388,7 +450,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		e.emitStepEventWithFindingsAndError(ipc.EventStepCompleted, run, repo, gate.step.Name(), string(types.StepStatusFailed), "", "aborted by user", &duration)
 		return e.failRun(run, repo, fmt.Errorf("step %s: aborted by user", gate.step.Name()), ctx)
 	case types.ActionFix:
-		telemetry.Track("fix", e.fixTelemetryFields("user", gate.step.Name(), selectedFindingCount(gate.findings, response.findingIDs), 0))
+		telemetry.Track("fix", e.fixTelemetryFields("user", gate.step.Name(), dispatchedFindingCount(gate.findings, response.findingIDs), 0))
 		selected := filterFindingsJSON(gate.findings, response.findingIDs)
 		merged := mergeUserOverridesJSON(selected, response.instructions, response.addedFindings)
 		if gate.lastRoundID != "" {
@@ -852,6 +914,8 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		e.mu.Lock()
 		e.waiting = true
 		e.waitingStep = stepName
+		e.waitingFindings = outcome.Findings
+		e.waitingRunID = run.ID
 		e.mu.Unlock()
 
 		// Parking starts before the gate becomes observable. This includes the
@@ -867,6 +931,8 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			e.mu.Lock()
 			e.waiting = false
 			e.waitingStep = ""
+			e.waitingFindings = ""
+			e.waitingRunID = ""
 			e.mu.Unlock()
 			return false, fmt.Errorf("persist %s approval gate: %w", stepName, dbErr)
 		}
@@ -896,9 +962,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		if agentName := e.telemetryAgentName(); agentName != "" {
 			approvalFields["agent"] = agentName
 		}
-		if selectedCount := selectedFindingCount(outcome.Findings, response.findingIDs); selectedCount > 0 {
-			approvalFields["selected_findings_count"] = selectedCount
-		}
+		setApprovalFindingCount(approvalFields, response.action, outcome.Findings, response.findingIDs)
 		telemetry.Track("approval", approvalFields)
 
 		switch response.action {
@@ -924,10 +988,10 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			return false, fmt.Errorf("step %s: aborted by user", stepName)
 
 		case types.ActionFix:
-			telemetry.Track("fix", e.fixTelemetryFields("user", stepName, selectedFindingCount(outcome.Findings, response.findingIDs), 0))
+			telemetry.Track("fix", e.fixTelemetryFields("user", stepName, dispatchedFindingCount(outcome.Findings, response.findingIDs), 0))
 			// Fix - mark step as fixing, resume execution timer, re-execute.
 			phaseStart = time.Now()
-			selectedCount := selectedFindingCount(outcome.Findings, response.findingIDs)
+			selectedCount := dispatchedFindingCount(outcome.Findings, response.findingIDs)
 			writeLog(fmt.Sprintf("user-fix round starting after round %d (%d %s selected)", roundNum, selectedCount, pluralize(selectedCount, "finding", "findings")))
 			if dbErr := e.db.UpdateStepStatus(sr.ID, types.StepStatusFixing); dbErr != nil {
 				slog.Warn("failed to update step status in db", "step", stepName, "status", "fixing", "error", dbErr)
@@ -1108,12 +1172,14 @@ func pluralize(n int, singular, plural string) string {
 // gate's external source of truth makes it obsolete, or the context is
 // cancelled. Reconciliation runs synchronously under a bounded child context,
 // so no watcher goroutine can outlive approval, cancellation, or shutdown.
-// The caller must set e.waiting and e.waitingStep before calling this method.
+// The caller must set the current waiting gate metadata before calling this method.
 func (e *Executor) waitForApprovalOrReconcile(ctx context.Context, step Step, sctx *StepContext, immediate bool) (approvalResponse, bool, error) {
 	defer func() {
 		e.mu.Lock()
 		e.waiting = false
 		e.waitingStep = ""
+		e.waitingFindings = ""
+		e.waitingRunID = ""
 		e.mu.Unlock()
 		// Drain any stale response that arrived after context cancellation or
 		// raced with an external reconciliation.
@@ -1175,6 +1241,8 @@ func (e *Executor) claimGateReconciliation() bool {
 	}
 	e.waiting = false
 	e.waitingStep = ""
+	e.waitingFindings = ""
+	e.waitingRunID = ""
 	return true
 }
 
@@ -1430,8 +1498,36 @@ func findingsCount(raw string) int {
 }
 
 func selectedFindingCount(raw string, ids []string) int {
-	if len(ids) > 0 {
-		return len(ids)
+	if len(ids) == 0 {
+		return findingsCount(raw)
 	}
-	return findingsCount(raw)
+	findings, err := types.ParseFindingsJSON(raw)
+	if err != nil {
+		return 0
+	}
+	return len(types.FilterFindings(findings, ids).Items)
+}
+
+// dispatchedFindingCount reports how many of the step's own findings a fix
+// round actually hands to the fix agent. An empty selection dispatches none
+// (filterFindingsJSON replaces the payload with an empty selection), so unlike
+// selectedFindingCount it never falls back to the round's total.
+func dispatchedFindingCount(raw string, ids []string) int {
+	if len(ids) == 0 {
+		return 0
+	}
+	return selectedFindingCount(raw, ids)
+}
+
+// setApprovalFindingCount records the finding count the approval event should
+// carry for this action. A fix reports what the fix round actually dispatches,
+// matching the fix event; every other action keeps reporting the round's total.
+func setApprovalFindingCount(fields telemetry.Fields, action types.ApprovalAction, raw string, ids []string) {
+	if action == types.ActionFix {
+		fields["selected_findings_count"] = dispatchedFindingCount(raw, ids)
+		return
+	}
+	if count := selectedFindingCount(raw, ids); count > 0 {
+		fields["selected_findings_count"] = count
+	}
 }

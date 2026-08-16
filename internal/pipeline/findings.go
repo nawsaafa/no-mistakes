@@ -297,6 +297,35 @@ func mergeUserOverridesJSON(raw string, instructions map[string]string, added []
 	return encoded
 }
 
+// unresolvedFindingIDs returns every selected ID absent from the supplied
+// findings, preserving selection order and ignoring duplicate requests. An
+// empty selection is valid: it deliberately dispatches no agent findings.
+func unresolvedFindingIDs(raw string, ids []string) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	findings, err := types.ParseFindingsJSON(raw)
+	if err != nil {
+		return nil, err
+	}
+	known := make(map[string]bool, len(findings.Items))
+	for _, item := range findings.Items {
+		known[item.ID] = true
+	}
+	missing := make([]string, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if !known[id] {
+			missing = append(missing, id)
+		}
+	}
+	return missing, nil
+}
+
 func filterFindingsJSON(raw string, ids []string) string {
 	if raw == "" {
 		return raw

@@ -3,6 +3,8 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -494,6 +496,177 @@ func TestExecutor_FixUsesSelectedFindingIDsOnly(t *testing.T) {
 	}
 	if items[0].ID != "review-2" || items[0].Description != "second" {
 		t.Fatalf("unexpected selected finding: %#v", items[0])
+	}
+}
+
+func TestExecutor_RejectsFixSelectionFromAnotherStep(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	var capturedFindings string
+	firstStep := &adaptiveCallStep{
+		name: types.StepTest,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			return &StepOutcome{
+				NeedsApproval: true,
+				Findings:      `{"findings":[{"id":"test-1","severity":"error","description":"test finding","action":"ask-user"}],"summary":"1 finding"}`,
+			}, nil
+		},
+	}
+	secondStepCalls := 0
+	secondStep := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			secondStepCalls++
+			if secondStepCalls == 1 {
+				return &StepOutcome{
+					NeedsApproval: true,
+					Findings:      `{"findings":[{"id":"review-1","severity":"error","description":"review finding","action":"auto-fix"}],"summary":"1 finding"}`,
+				}, nil
+			}
+			capturedFindings = sctx.PreviousFindings
+			return &StepOutcome{}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{firstStep, secondStep}, nil)
+	done := make(chan error, 1)
+	go func() {
+		done <- exec.Execute(context.Background(), run, repo, workDir)
+	}()
+
+	waitForStepStatus(t, database, run.ID, types.StepTest, types.StepStatusAwaitingApproval)
+	if err := exec.Respond(types.StepTest, types.ActionApprove, nil); err != nil {
+		t.Fatal(err)
+	}
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+
+	err := exec.RespondWithOverrides(
+		types.StepReview,
+		types.ActionFix,
+		[]string{"test-1"},
+		map[string]string{"test-1": "do not carry this instruction into review"},
+		[]types.Finding{{Severity: "warning", Description: "do not add this finding", Action: types.ActionAutoFix}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "test-1") || !strings.Contains(err.Error(), "belongs to test step") {
+		t.Fatalf("cross-step fix selection error = %v, want test-1 attributed to test", err)
+	}
+
+	steps, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundReview := false
+	for _, persistedStep := range steps {
+		if persistedStep.StepName != types.StepReview {
+			continue
+		}
+		foundReview = true
+		if persistedStep.Status != types.StepStatusAwaitingApproval {
+			t.Fatalf("review status after rejected selection = %s, want awaiting_approval", persistedStep.Status)
+		}
+	}
+	if !foundReview {
+		t.Fatal("review step was not persisted")
+	}
+
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"review-1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("executor timed out")
+	}
+
+	if secondStepCalls != 2 {
+		t.Fatalf("review step calls = %d, want initial and valid fix", secondStepCalls)
+	}
+	items := mustParseFindingItems(t, capturedFindings)
+	if len(items) != 1 || items[0].ID != "review-1" {
+		t.Fatalf("fix findings = %#v, want only review-1", items)
+	}
+	if strings.Contains(capturedFindings, "do not carry") || strings.Contains(capturedFindings, "do not add") {
+		t.Fatalf("rejected selection overrides leaked into fix findings: %s", capturedFindings)
+	}
+}
+
+func TestExecutor_UserFixWithOnlyAddedFindingLogsZeroSelectedGateFindings(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+
+	var capturedFindings string
+	calls := 0
+	step := &adaptiveCallStep{
+		name: types.StepReview,
+		fn: func(sctx *StepContext) (*StepOutcome, error) {
+			calls++
+			if calls == 1 {
+				return &StepOutcome{
+					NeedsApproval: true,
+					Findings: `{"findings":[` +
+						`{"id":"review-1","severity":"error","description":"first","action":"auto-fix"},` +
+						`{"id":"review-2","severity":"error","description":"second","action":"auto-fix"},` +
+						`{"id":"review-3","severity":"error","description":"third","action":"auto-fix"}` +
+						`],"summary":"3 findings"}`,
+				}, nil
+			}
+			capturedFindings = sctx.PreviousFindings
+			return &StepOutcome{}, nil
+		},
+	}
+
+	exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+	done := make(chan error, 1)
+	go func() {
+		done <- exec.Execute(context.Background(), run, repo, workDir)
+	}()
+
+	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+	if err := exec.RespondWithOverrides(
+		types.StepReview,
+		types.ActionFix,
+		nil,
+		nil,
+		[]types.Finding{{Severity: "warning", Description: "operator finding", Action: types.ActionAutoFix}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("executor timed out")
+	}
+
+	items := mustParseFindingItems(t, capturedFindings)
+	if len(items) != 1 || items[0].Description != "operator finding" {
+		t.Fatalf("fix findings = %#v, want only the user-added finding", items)
+	}
+
+	data, err := os.ReadFile(filepath.Join(p.RunLogDir(run.ID), "review.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if content := string(data); !strings.Contains(content, "user-fix round starting after round 1 (0 findings selected)") {
+		t.Fatalf("log must report 0 dispatched gate findings, got:\n%s", content)
+	}
+}
+
+func TestSelectedFindingCountCountsOnlyMatchingIDs(t *testing.T) {
+	raw := `{"findings":[{"id":"review-1","severity":"error","description":"first"}],"summary":"1 finding"}`
+
+	if got := selectedFindingCount(raw, []string{"review-1", "test-1", "missing"}); got != 1 {
+		t.Fatalf("selected finding count = %d, want 1 matching finding", got)
+	}
+	if got := selectedFindingCount(raw, []string{"test-1"}); got != 0 {
+		t.Fatalf("selected finding count = %d, want 0 unmatched findings", got)
 	}
 }
 

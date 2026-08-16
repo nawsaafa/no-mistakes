@@ -144,6 +144,10 @@ no-mistakes axi respond --action skip
 | `--add-finding`  | `string` | (none)        | JSON finding object to add and fix                                   |
 | `-y`, `--yes`    | `bool`   | `false`       | Auto-resolve every subsequent gate until a decision point or outcome |
 
+Every `--findings` ID must belong to the gate being answered.
+If any listed ID does not resolve against the awaiting step's findings, `axi respond` rejects the whole response, naming each unresolved ID together with the step that owns it when another step of the run recorded it, and leaves the gate open; `--instructions` and `--add-finding` from that rejected call are not applied either.
+Read the IDs from the gate's own `findings` table (or `no-mistakes axi status`) and respond again.
+
 After the explicit response, `--yes` uses the same auto-resolution behavior as `axi run --yes`: have the pipeline fix `auto-fix` and `ask-user` findings once, approve the fix review, approve gates that only contain non-actionable `no-op` findings, and stop at `outcome: checks-passed` when the CI monitor reports readiness but the PR still needs a human merge.
 Each `axi respond` blocks until the next gate, CI-ready decision point, or final outcome.
 If it returns another `gate:`, answer that gate; do not idle-wait for the run to move forward by itself.
