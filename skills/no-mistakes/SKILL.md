@@ -204,6 +204,16 @@ Run the pipeline and decide on its findings as they come up:
 
     Each `respond` blocks until the next `gate:`, `checks-passed` decision point, or final outcome.
 
+    If the CI step is visibly stuck at `running` because its reader keeps failing, do not
+    abort or claim that it passed. A supervisor who independently checked the forge may close that
+    monitor with evidence, but both the observation and its supplier are mandatory:
+    ```sh
+    no-mistakes axi ci-close --run <id> \\
+      --evidence "GitHub PR #42 checks green at <sha>" \\
+      --evidence-by "<person or supervisor>"
+    ```
+    The close is refused without either field, and both are retained in the CI step record.
+
     Two extra flags are available on `respond` when you need them:
     - `--add-finding '<json>'` (with `--action fix`) folds a finding you
       spotted yourself - one the pipeline did not surface - into the fix round,

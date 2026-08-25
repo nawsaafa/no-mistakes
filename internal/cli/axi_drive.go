@@ -871,6 +871,71 @@ func gateStatusFor(rv runView, step string) string {
 	return string(types.StepStatusAwaitingApproval)
 }
 
+func newAxiCICloseCmd() *cobra.Command {
+	var runID, what, suppliedBy string
+	cmd := &cobra.Command{
+		Use:           "ci-close",
+		Short:         "Close a running CI monitor with external forge evidence",
+		Long:          "Closes only a currently running CI step. The supplied evidence and its supplier are persisted with the step; both are required, so this command cannot assert an unsubstantiated green result. Use --run from any worktree when a supervisor is recovering a blind monitor.",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return trackAxiSurface("axi-ci-close", "/axi/ci-close", nil, func() error {
+				return runAxiCIClose(cmd, runID, what, suppliedBy)
+			})
+		},
+	}
+	cmd.Flags().StringVar(&runID, "run", "", "running CI monitor run id (required)")
+	cmd.Flags().StringVar(&what, "evidence", "", "what the external forge showed (required)")
+	cmd.Flags().StringVar(&suppliedBy, "evidence-by", "", "who independently supplied or verified the evidence (required)")
+	return cmd
+}
+
+func runAxiCIClose(cmd *cobra.Command, runID, what, suppliedBy string) error {
+	runID = strings.TrimSpace(runID)
+	what = strings.TrimSpace(what)
+	suppliedBy = strings.TrimSpace(suppliedBy)
+	if runID == "" || what == "" || suppliedBy == "" {
+		return emitError(cmd, 2, "--run, --evidence, and --evidence-by are required", "Example: no-mistakes axi ci-close --run <id> --evidence \"GitHub checks green at <sha>\" --evidence-by \"supervisor\"")
+	}
+	env, err := openAxiExplicitRunDaemonEnv(runID)
+	if err != nil {
+		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
+	}
+	defer env.close()
+
+	if err := sendCIClose(env.client, runID, what, suppliedBy); err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("close CI monitor: %v", err))
+	}
+	if err := waitStepLeavesGate(cmd.Context(), env.p.Socket(), runID, string(types.StepCI), string(types.StepStatusRunning)); err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("wait for CI close: %v", err))
+	}
+	final, err := getRunInfo(env.client, runID)
+	if err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("load closed run: %v", err))
+	}
+	emitDoc(cmd,
+		toon.Field{Key: "ci_closed", Value: true},
+		toon.Field{Key: "evidence", Value: what},
+		toon.Field{Key: "evidence_by", Value: suppliedBy},
+		toon.Field{Key: "run", Value: runID},
+		toon.Field{Key: "run_status", Value: string(final.Status)},
+	)
+	return nil
+}
+
+func sendCIClose(client *ipc.Client, runID, what, suppliedBy string) error {
+	var result ipc.CloseCIResult
+	if err := client.Call(ipc.MethodCloseCI, &ipc.CloseCIParams{RunID: runID, What: what, SuppliedBy: suppliedBy}, &result); err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("daemon rejected the CI close")
+	}
+	return nil
+}
+
 func newAxiAbortCmd() *cobra.Command {
 	var runID string
 	cmd := &cobra.Command{

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -57,12 +58,17 @@ type Executor struct {
 	shared   *RunShared
 	workDir  string
 
-	mu              sync.Mutex
-	approvalCh      chan approvalResponse // buffered channel for approval responses
-	waiting         bool                  // true when blocked on approval
-	waitingStep     types.StepName        // which step is currently awaiting approval
-	waitingFindings string                // immutable findings payload for the current gate
-	waitingRunID    string                // run containing the current gate
+	mu               sync.Mutex
+	approvalCh       chan approvalResponse // buffered channel for approval responses
+	waiting          bool                  // true when blocked on approval
+	waitingStep      types.StepName        // which step is currently awaiting approval
+	waitingFindings  string                // immutable findings payload for the current gate
+	waitingRunID     string                // run containing the current gate
+	runningStep      types.StepName
+	ciStepResultID   string
+	ciExternalClose  chan types.ExternalEvidence
+	ciCloseRequested bool
+	ciCloseReady     atomic.Bool
 
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
@@ -147,6 +153,79 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 		addedFindings: addedFindings,
 	}
 	return nil
+}
+
+// CloseRunningCI closes the active CI monitor using explicitly supplied
+// external forge evidence. It is deliberately unavailable for parked or
+// non-CI steps: those have their existing approval semantics, while this
+// surface exists only to recover a reader that is still running.
+func (e *Executor) CloseRunningCI(evidence types.ExternalEvidence) error {
+	evidence.What = safeurl.RedactText(strings.TrimSpace(evidence.What))
+	evidence.SuppliedBy = strings.TrimSpace(evidence.SuppliedBy)
+	if evidence.What == "" || evidence.SuppliedBy == "" {
+		return fmt.Errorf("external CI evidence requires both what was observed and who supplied it")
+	}
+
+	// Snapshot the executor-owned delivery state, then verify the persisted
+	// state outside the mutex. runningStep remains set while executeStep waits
+	// at an approval gate, so it is not sufficient to distinguish a live
+	// monitor from a parked one.
+	e.mu.Lock()
+	if e.runningStep != types.StepCI || e.ciExternalClose == nil || e.waiting || e.ciStepResultID == "" {
+		e.mu.Unlock()
+		return fmt.Errorf("CI step is not currently running")
+	}
+	if !e.ciCloseReady.Load() {
+		e.mu.Unlock()
+		return fmt.Errorf("CI monitor is not currently blind")
+	}
+	stepID := e.ciStepResultID
+	e.mu.Unlock()
+
+	step, err := e.db.GetStepResult(stepID)
+	if err != nil {
+		return fmt.Errorf("check CI step state: %w", err)
+	}
+	if step == nil || step.Status != types.StepStatusRunning {
+		return fmt.Errorf("CI step is not currently running")
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Re-check every mutable condition after the DB read. A monitor may have
+	// entered its approval gate while the state query was in flight.
+	if e.runningStep != types.StepCI || e.ciExternalClose == nil || e.waiting || e.ciStepResultID != stepID {
+		return fmt.Errorf("CI step is not currently running")
+	}
+	if !e.ciCloseReady.Load() {
+		return fmt.Errorf("CI monitor is not currently blind")
+	}
+	if e.ciCloseRequested {
+		return fmt.Errorf("external CI close already requested")
+	}
+	select {
+	case e.ciExternalClose <- evidence:
+		e.ciCloseRequested = true
+		return nil
+	default:
+		return fmt.Errorf("CI close request could not be delivered")
+	}
+}
+
+func (e *Executor) discardPendingCIClose() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.ciExternalClose == nil {
+		return
+	}
+	for {
+		select {
+		case <-e.ciExternalClose:
+			e.ciCloseRequested = false
+		default:
+			return
+		}
+	}
 }
 
 // validateFindingSelection refuses a fix selection that names an ID outside
@@ -623,6 +702,26 @@ func recoveredLogPath(step *db.StepResult) string {
 // Returns (skipRemaining, error).
 func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult, run *db.Run, repo *db.Repo, workDir, logDir string, state stepExecutionState) (bool, error) {
 	stepName := step.Name()
+	var ciExternalClose chan types.ExternalEvidence
+	if stepName == types.StepCI {
+		ciExternalClose = make(chan types.ExternalEvidence, 1)
+		e.mu.Lock()
+		e.runningStep = stepName
+		e.ciStepResultID = sr.ID
+		e.ciExternalClose = ciExternalClose
+		e.ciCloseRequested = false
+		e.ciCloseReady.Store(false)
+		e.mu.Unlock()
+		defer func() {
+			e.mu.Lock()
+			e.runningStep = ""
+			e.ciStepResultID = ""
+			e.ciExternalClose = nil
+			e.ciCloseRequested = false
+			e.ciCloseReady.Store(false)
+			e.mu.Unlock()
+		}()
+	}
 	logPath := filepath.Join(logDir, string(stepName)+".log")
 	finalExitCode := 0
 	autoFixLimit := 0
@@ -771,7 +870,9 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			fmt.Fprintln(logFile, text)
 			touchLogActivity(text, true)
 		},
-		CIReadinessChanged: ciReadinessChanged,
+		CIReadinessChanged:      ciReadinessChanged,
+		SetCIExternalCloseReady: e.ciCloseReady.Store,
+		CIExternalClose:         ciExternalClose,
 	}
 
 	nextTrigger := "initial"
@@ -785,6 +886,11 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 
 	// Execute with possible fix loop
 	for {
+		if stepName == types.StepCI {
+			// A request accepted in the previous round but not consumed before
+			// the gate opened is stale. Never let it cross an approval boundary.
+			e.discardPendingCIClose()
+		}
 		outcome, err := step.Execute(sctx)
 		roundNum++
 		roundDuration := time.Since(phaseStart).Milliseconds()
@@ -917,6 +1023,11 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		e.waitingFindings = outcome.Findings
 		e.waitingRunID = run.ID
 		e.mu.Unlock()
+		if stepName == types.StepCI {
+			// Set waiting before draining so a concurrent close cannot be
+			// accepted between the gate transition and this cleanup.
+			e.discardPendingCIClose()
+		}
 
 		// Parking starts before the gate becomes observable. This includes the
 		// small handoff from publishing the gate to receiving a response, and

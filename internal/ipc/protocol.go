@@ -18,6 +18,7 @@ const (
 	MethodRerun          = "rerun"
 	MethodSubscribe      = "subscribe"
 	MethodRespond        = "respond"
+	MethodCloseCI        = "close_ci"
 	MethodCancelRun      = "cancel_run"
 	MethodGateContext    = "gate_context"
 	MethodAdmitPush      = "admit_push"
@@ -151,6 +152,15 @@ type RespondParams struct {
 	AddedFindings []types.Finding      `json:"added_findings,omitempty"`
 }
 
+// CloseCIParams closes a still-running CI monitor using external forge
+// evidence. Both fields are mandatory; an unsubstantiated green override is
+// intentionally not representable.
+type CloseCIParams struct {
+	RunID      string `json:"run_id"`
+	What       string `json:"what"`
+	SuppliedBy string `json:"supplied_by"`
+}
+
 // CancelRunParams cancels an active pipeline run.
 type CancelRunParams struct {
 	RunID string `json:"run_id"`
@@ -204,6 +214,11 @@ type RerunResult struct {
 
 // RespondResult confirms the action was accepted.
 type RespondResult struct {
+	OK bool `json:"ok"`
+}
+
+// CloseCIResult confirms the running CI monitor accepted the external evidence.
+type CloseCIResult struct {
 	OK bool `json:"ok"`
 }
 

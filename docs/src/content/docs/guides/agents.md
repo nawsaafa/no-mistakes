@@ -156,6 +156,7 @@ The CI monitor stays live in the background after checks pass, and when it sees 
 A PR that is merely behind but still clean needs nothing either, since the platform merges it.
 The one exception is when that monitor is no longer running - the PR was closed, the run was aborted or superseded, it idle-timed-out, or its auto-fix attempts were exhausted - in which case the agent recovers with `no-mistakes rerun`, which cancels the stale monitor and re-runs the full pipeline including a deterministic rebase step.
 The agent must not use `no-mistakes axi run` to refresh a still-active PR: after `checks-passed` it reattaches to the running monitor with HEAD unchanged and returns the monitor output without rebasing.
+If a CI monitor is still `running` because its reader keeps failing, an independently verified forge result may close it with `no-mistakes axi ci-close --run <id> --evidence "..." --evidence-by "..."`; both the observed result and its supplier are required and retained in the CI step record. Never use an evidence-free override, `abort`, or a rerun to manufacture a green result.
 
 In task-first mode, if the repo is on the default branch, the skill tells the agent to create a feature branch before committing because the gate validates committed history on a non-default branch.
 The agent should inspect `git status` before changing or committing anything, preserve unrelated pre-existing uncommitted changes, and commit only the changes that belong to the user's task.
@@ -169,6 +170,7 @@ no-mistakes axi sync --check
 no-mistakes axi sync
 no-mistakes axi sync --recover
 no-mistakes axi respond --action approve
+no-mistakes axi ci-close --run <id> --evidence "GitHub checks green at <sha>" --evidence-by "supervisor"
 no-mistakes axi logs --step review --full
 no-mistakes axi abort
 no-mistakes axi abort --run <id>

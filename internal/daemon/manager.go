@@ -1052,6 +1052,20 @@ func telemetryFailedStepName(database *db.DB, runID string) string {
 	return ""
 }
 
+// HandleCloseCI forwards an evidence-bearing close request to the running CI
+// monitor. It does not mutate the database directly: the executor consumes the
+// request, records the evidence as the step findings, and completes the step
+// through its normal terminal path.
+func (m *RunManager) HandleCloseCI(runID string, evidence types.ExternalEvidence) error {
+	m.mu.Lock()
+	exec, ok := m.executors[runID]
+	m.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("no active executor for run %s", runID)
+	}
+	return exec.CloseRunningCI(evidence)
+}
+
 // HandleRespond routes a user approval action to the executor for the given run.
 func (m *RunManager) HandleRespond(runID string, step types.StepName, action types.ApprovalAction, findingIDs []string) error {
 	return m.HandleRespondWithOverrides(runID, step, action, findingIDs, nil, nil)

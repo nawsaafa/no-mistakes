@@ -298,62 +298,49 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 	if err != nil {
 		return nil, err
 	}
-	args := append([]string{"pr", "view", selector}, h.repoArgs()...)
-	args = append(args, "--json", "statusCheckRollup")
+	// `gh pr view --json statusCheckRollup` exposes the GraphQL union directly.
+	// Its CheckRun and StatusContext members do not share a conclusive field;
+	// in practice third-party commit status contexts can arrive with a null
+	// conclusion even while `gh pr checks` correctly reports them as passing.
+	// Use gh's normalized projection so both kinds participate in readiness.
+	args := append([]string{"pr", "checks", selector}, h.repoArgs()...)
+	args = append(args, "--json", "name,state,bucket,completedAt,link")
 	cmd := h.cmd(ctx, "gh", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("gh pr view statusCheckRollup: %s: %w", boundedCommandOutput(out), err)
+	// gh uses its exit status as a verdict: pending and failing checks are
+	// non-zero even though stdout contains the complete JSON observation. Read
+	// stdout independently of that status; only an unparseable payload is a
+	// reader failure. Output() also preserves stderr on ExitError for the real
+	// command-failure diagnostic below.
+	out, err := cmd.Output()
+	var raw []struct {
+		Name        string `json:"name"`
+		State       string `json:"state"`
+		Bucket      string `json:"bucket"`
+		CompletedAt string `json:"completedAt"`
+		Link        string `json:"link"`
 	}
-	var raw struct {
-		StatusCheckRollup []githubStatusCheck `json:"statusCheckRollup"`
-	}
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, fmt.Errorf("parse CI checks: %w", err)
-	}
-	checks := make([]scm.Check, 0, len(raw.StatusCheckRollup))
-	for _, r := range raw.StatusCheckRollup {
-		state := strings.ToUpper(strings.TrimSpace(r.Conclusion))
-		if state == "" {
-			state = strings.ToUpper(strings.TrimSpace(r.State))
+	parseErr := json.Unmarshal(out, &raw)
+	if parseErr != nil {
+		failureOutput := commandFailureOutput(out, err)
+		if strings.Contains(string(failureOutput), "no checks reported") {
+			return nil, nil
 		}
+		if err != nil {
+			return nil, fmt.Errorf("gh pr checks: %s: %w", boundedCommandOutput(failureOutput), err)
+		}
+		return nil, fmt.Errorf("parse CI checks: %w", parseErr)
+	}
+	checks := make([]scm.Check, 0, len(raw))
+	for _, r := range raw {
 		checks = append(checks, scm.Check{
-			Name:        r.checkName(),
-			Bucket:      githubStatusCheckBucket(r),
-			State:       state,
+			Name:        strings.TrimSpace(r.Name),
+			Bucket:      normalizeCheckBucket(r.Bucket, r.State),
+			State:       strings.ToUpper(strings.TrimSpace(r.State)),
 			CompletedAt: parseGitHubTime(r.CompletedAt),
-			Link:        strings.TrimSpace(r.detailsLink()),
+			Link:        strings.TrimSpace(r.Link),
 		})
 	}
 	return checks, nil
-}
-
-// githubStatusCheck is the common subset returned by GitHub's CheckRun and
-// StatusContext union members in statusCheckRollup.
-type githubStatusCheck struct {
-	Type        string `json:"__typename"`
-	Name        string `json:"name"`
-	Context     string `json:"context"`
-	State       string `json:"state"`
-	Status      string `json:"status"`
-	Conclusion  string `json:"conclusion"`
-	CompletedAt string `json:"completedAt"`
-	DetailsURL  string `json:"detailsUrl"`
-	TargetURL   string `json:"targetUrl"`
-}
-
-func (r githubStatusCheck) checkName() string {
-	if strings.TrimSpace(r.Name) != "" {
-		return strings.TrimSpace(r.Name)
-	}
-	return strings.TrimSpace(r.Context)
-}
-
-func (r githubStatusCheck) detailsLink() string {
-	if strings.TrimSpace(r.DetailsURL) != "" {
-		return r.DetailsURL
-	}
-	return r.TargetURL
 }
 
 func parseGitHubTime(raw string) time.Time {
@@ -361,17 +348,17 @@ func parseGitHubTime(raw string) time.Time {
 	return parsed
 }
 
-func githubStatusCheckBucket(r githubStatusCheck) scm.CheckBucket {
-	if outcome := strings.TrimSpace(r.Conclusion); outcome != "" {
-		return normalizeCheckBucket("", outcome)
-	}
-	if state := strings.TrimSpace(r.State); state != "" {
-		return normalizeCheckBucket("", state)
-	}
-	return normalizeCheckBucket("", r.Status)
-}
-
 const maxGitHubCommandOutput = 4096
+
+func commandFailureOutput(stdout []byte, err error) []byte {
+	if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+		combined := make([]byte, 0, len(stdout)+len(exitErr.Stderr))
+		combined = append(combined, stdout...)
+		combined = append(combined, exitErr.Stderr...)
+		return combined
+	}
+	return stdout
+}
 
 func boundedCommandOutput(out []byte) string {
 	text := strings.TrimSpace(safeurl.RedactText(string(out)))

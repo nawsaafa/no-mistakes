@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -20,6 +21,72 @@ import (
 // small number of consecutive read failures, carrying the reader error as
 // ask-user evidence so a reachable skip can record honestly why it was
 // skipped.
+func TestCIStep_RunningReaderCanBeClosedWithExternalEvidence(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	env := fakeCIGHChecksError(t, "OPEN", "", "gh: checks unavailable")
+	prURL := "https://github.com/test/repo/pull/42"
+	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = env
+	sctx.Run.PRURL = &prURL
+	sctx.Config.CITimeout = -1
+	closeCh := make(chan types.ExternalEvidence, 1)
+	sctx.CIExternalClose = closeCh
+	polls := 0
+	step := &CIStep{waitForNextPoll: func(context.Context, time.Duration) error {
+		polls++
+		if polls == 1 {
+			closeCh <- types.ExternalEvidence{What: "GitHub PR #42 checks green at abc123", SuppliedBy: "release supervisor"}
+		}
+		return nil
+	}}
+
+	outcome, err := step.Execute(sctx)
+	if err != nil {
+		t.Fatalf("close request should finish the running monitor: %v", err)
+	}
+	if outcome.NeedsApproval {
+		t.Fatalf("external close must not park the reader-error step: %+v", outcome)
+	}
+	var findings Findings
+	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
+		t.Fatalf("unmarshal external evidence: %v", err)
+	}
+	if findings.ExternalEvidence == nil {
+		t.Fatalf("external evidence was not attached to step record: %s", outcome.Findings)
+	}
+	if findings.ExternalEvidence.What != "GitHub PR #42 checks green at abc123" || findings.ExternalEvidence.SuppliedBy != "release supervisor" {
+		t.Fatalf("wrong external evidence: %+v", findings.ExternalEvidence)
+	}
+}
+
+func TestCIStep_FixRoundDiscardsStaleExternalCloseBeforePolling(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContext(t, &mockAgent{name: "test"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Env = fakeCIGH(t, "OPEN", `[{"name":"build","state":"SUCCESS","bucket":"pass"}]`)
+	prURL := "https://github.com/test/repo/pull/42"
+	sctx.Run.PRURL = &prURL
+	sctx.Config.CITimeout = -1
+	sctx.Fixing = true
+	closeCh := make(chan types.ExternalEvidence, 1)
+	closeCh <- types.ExternalEvidence{What: "green at stale-head", SuppliedBy: "supervisor"}
+	sctx.CIExternalClose = closeCh
+	polls := 0
+	step := &CIStep{waitForNextPoll: func(context.Context, time.Duration) error {
+		polls++
+		return errors.New("stop after first fresh poll")
+	}}
+
+	outcome, err := step.Execute(sctx)
+	if err == nil || !strings.Contains(err.Error(), "first fresh poll") {
+		t.Fatalf("fix round consumed stale close instead of polling: outcome=%+v err=%v", outcome, err)
+	}
+	if polls != 1 {
+		t.Fatalf("fresh fix round polls = %d, want exactly one", polls)
+	}
+}
+
 func TestCIStep_PersistentReaderErrorParksWithEvidence(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)

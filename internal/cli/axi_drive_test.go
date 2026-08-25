@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,7 +18,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -30,6 +33,110 @@ func ciRunView(ciStatus types.StepStatus) runView {
 			{Name: string(types.StepPR), Status: string(types.StepStatusCompleted)},
 			{Name: string(types.StepCI), Status: string(ciStatus)},
 		},
+	}
+}
+
+// TestAxiCICloseRunsOutsideTheStalledWorker exercises the recovery surface as
+// it is available during a real blind-monitor incident: a separate foreground
+// process invokes `axi ci-close --run`, from a directory unrelated to the run,
+// and reaches the daemon only through IPC. Calling Executor.CloseRunningCI
+// directly would miss the only path left when the worker's composer is blocked.
+func TestAxiCICloseRunsOutsideTheStalledWorker(t *testing.T) {
+	root := makeSocketSafeTempDir(t)
+	t.Setenv("NM_HOME", root)
+	p := paths.WithRoot(root)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repo, err := database.InsertRepoWithID("repo-outside", "/tmp/worker-worktree", "https://github.com/test/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.InsertRun(repo.ID, "feature/blind", "base", "head-91")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	closeRequests := make(chan ipc.CloseCIParams, 1)
+	completed := types.StepStatusCompleted
+	runInfo := &ipc.RunInfo{
+		ID:      run.ID,
+		RepoID:  repo.ID,
+		Branch:  run.Branch,
+		HeadSHA: run.HeadSHA,
+		Status:  types.RunRunning,
+		Steps:   []ipc.StepResultInfo{{StepName: types.StepCI, Status: completed}},
+	}
+	srv := ipc.NewServer()
+	srv.Handle(ipc.MethodHealth, func(context.Context, json.RawMessage) (interface{}, error) {
+		return &ipc.HealthResult{Status: "ok"}, nil
+	})
+	srv.Handle(ipc.MethodCloseCI, func(_ context.Context, raw json.RawMessage) (interface{}, error) {
+		var params ipc.CloseCIParams
+		if err := json.Unmarshal(raw, &params); err != nil {
+			return nil, err
+		}
+		closeRequests <- params
+		return &ipc.CloseCIResult{OK: true}, nil
+	})
+	srv.Handle(ipc.MethodGetRun, func(_ context.Context, _ json.RawMessage) (interface{}, error) {
+		return &ipc.GetRunResult{Run: runInfo}, nil
+	})
+	srv.HandleStream(ipc.MethodSubscribe, func(ctx context.Context, _ json.RawMessage) (ipc.StreamFunc, error) {
+		return func(_ func(interface{}) error) error {
+			<-ctx.Done()
+			return nil
+		}, nil
+	})
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.Serve(p.Socket()) }()
+	started := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		client, dialErr := ipc.Dial(p.Socket())
+		if dialErr == nil {
+			_ = client.Close()
+			started = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !started {
+		srv.Close()
+		<-errCh
+		t.Fatalf("fake daemon IPC server did not start")
+	}
+	t.Cleanup(func() {
+		srv.Close()
+		if err := <-errCh; err != nil {
+			t.Errorf("fake daemon server: %v", err)
+		}
+	})
+
+	// The child has no access to the worker's process or composer. Its cwd is
+	// also unrelated, proving that --run is the complete recovery address.
+	cmd := exec.Command(os.Args[0], "axi", "ci-close", "--run", run.ID, "--evidence", "green at head-91", "--evidence-by", "supervisor")
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(), "NM_HOOK_HELPER=1")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("external axi ci-close failed: %v\n%s", err, output)
+	}
+	select {
+	case got := <-closeRequests:
+		if got.RunID != run.ID || got.What != "green at head-91" || got.SuppliedBy != "supervisor" {
+			t.Fatalf("IPC close request = %+v, want run/evidence from external process", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("external axi ci-close never reached the daemon IPC handler")
+	}
+	if !strings.Contains(string(output), "ci_closed: true") {
+		t.Fatalf("external axi ci-close output omitted success: %s", output)
 	}
 }
 

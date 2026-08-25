@@ -51,6 +51,14 @@ type StepContext struct {
 	// step in the same run (e.g. the combined document+lint pass).
 	Shared             *RunShared
 	CIReadinessChanged func(ready, declaredNoCI bool)
+	// SetCIExternalCloseReady is maintained by the CI monitor and is true only
+	// after the configured consecutive reader-error threshold. The executor
+	// uses it to keep external closure scoped to a demonstrably blind monitor.
+	SetCIExternalCloseReady func(bool)
+	// CIExternalClose receives a supervisor's independently verified forge
+	// evidence while the CI monitor is still running. It is intentionally
+	// scoped to CI and carries both the observation and its supplier.
+	CIExternalClose <-chan types.ExternalEvidence
 }
 
 // RunAgentSession executes one turn of a durable review-loop role session,
