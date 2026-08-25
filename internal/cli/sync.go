@@ -28,7 +28,8 @@ func newSyncCmd() *cobra.Command {
 			"merges genuine divergence, rebases, switches branches, or updates a remote.\n" +
 			"--check performs the fresh proof without applying it.\n" +
 			"--recover returns custody of a branch whose run went terminal with unpublished\n" +
-			"pipeline commits: it anchors the preserved head, then either fast-forwards a\n" +
+			"pipeline commits: it prefers the run-scoped custody hold over a stale cached\n" +
+			"head, anchors the verified preserved tip, then either fast-forwards a\n" +
 			"clean behind worktree or adopts a diverged preserved head only when proven to\n" +
 			"carry every local change. Unproven divergence refuses. A run cancelled before\n" +
 			"the pipeline changed anything releases the branch by itself (user_owned) and\n" +

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	gitpkg "github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
@@ -66,6 +67,39 @@ func (s *cancellationRaceStep) Execute(sctx *pipelinepkg.StepContext) (*pipeline
 // dogfood report: a run went terminal at the pre_push phase, so its pipeline
 // fix commits exist only in the local gate's bare branch while the registered
 // operator worktree still sits at the submitted head with no push binding.
+// TestRecoverStaleRecordedHeadUsesNewestHeldFixChain is the operator incident
+// regression: the run row points at an older fix, while the gate branch has
+// fallen back to that stale pointer. The run-scoped custody hold still names
+// the newest multi-commit fix chain, so recovery must adopt it.
+func TestRecoverStaleRecordedHeadUsesNewestHeldFixChain(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	stale := mustRun(t, f.gate, "rev-parse", f.preserved+"~1")
+	if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunCancelled, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := custody.AnchorCurrent(f.ctx, f.gate, f.run.ID, f.preserved); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", stale, f.preserved)
+
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed {
+		t.Fatalf("stale recovery did not use held head: %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("recovery HEAD = %s, want newest preserved %s (stale %s)", got, f.preserved, stale)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.anchorRef()); got != f.preserved {
+		t.Fatalf("preserved anchor = %s, want %s", got, f.preserved)
+	}
+	updated, err := f.db.GetRun(f.run.ID)
+	if err != nil || updated.HeadSHA != f.preserved {
+		t.Fatalf("recorded head = %s, want newest preserved %s (err=%v)", updated.HeadSHA, f.preserved, err)
+	}
+}
+
 type recoverFixture struct {
 	t         *testing.T
 	ctx       context.Context
@@ -164,6 +198,121 @@ func (f *recoverFixture) custodyReturned() bool {
 		f.t.Fatalf("reload run: %#v, %v", run, err)
 	}
 	return run.CustodyReturnedAt != nil
+}
+
+func TestRecoverUsesVerifiedSHAWhenGateBranchIsMissing(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	// Fetch the exact preserved SHA, then remove every ref that names it. The
+	// object remains available by its verified SHA, but the branch ref is gone.
+	mustRun(t, f.local, "fetch", f.gate, f.preserved)
+	_ = os.Remove(filepath.Join(f.local, ".git", "FETCH_HEAD"))
+	mustRun(t, f.gate, "update-ref", "-d", "refs/heads/feature/recover")
+
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed {
+		t.Fatalf("SHA-only recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("HEAD = %s, want %s", got, f.preserved)
+	}
+}
+
+func TestRecoverRejectsHoldThatDoesNotDescendFromRecordedHead(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	stale := mustRun(t, f.gate, "rev-parse", f.preserved+"~1")
+	if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunCancelled, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := custody.AnchorCurrent(f.ctx, f.gate, f.run.ID, f.submitted); err != nil {
+		t.Fatal(err)
+	}
+	beforeGate := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover")
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_stale_head" {
+		t.Fatalf("stale hold recovery = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("stale hold moved HEAD to %s", got)
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != beforeGate {
+		t.Fatalf("stale hold changed gate branch to %s", got)
+	}
+	if f.custodyReturned() {
+		t.Fatal("stale hold refusal stamped custody")
+	}
+}
+
+func TestRecoverRejectsAmbiguousGateAdvanceBeyondHeldHead(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	if err := custody.AnchorCurrent(f.ctx, f.gate, f.run.ID, f.preserved); err != nil {
+		t.Fatal(err)
+	}
+	writer := filepath.Join(t.TempDir(), "writer")
+	mustRun(t, filepath.Dir(writer), "clone", f.gate, writer)
+	configureIdentity(t, writer)
+	mustRun(t, writer, "checkout", "feature/recover")
+	mustWrite(t, filepath.Join(writer, "ambiguous.txt"), "not this run\n")
+	mustRun(t, writer, "add", "ambiguous.txt")
+	mustRun(t, writer, "commit", "-m", "ambiguous later write")
+	mustRun(t, writer, "push", "origin", "HEAD:refs/heads/feature/recover")
+	before := mustRun(t, f.local, "rev-parse", "HEAD")
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_diverged" {
+		t.Fatalf("ambiguous gate advance = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != before {
+		t.Fatalf("ambiguous gate advance moved HEAD to %s", got)
+	}
+}
+
+func TestRecoverRefusesMissingRecordedObjectWithoutBranch(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	missing := strings.Repeat("f", 40)
+	if err := f.db.UpdateRunStatusWithVerifiedHead(f.run.ID, types.RunCancelled, missing); err != nil {
+		t.Fatal(err)
+	}
+	mustRun(t, f.gate, "update-ref", "-d", "refs/heads/feature/recover")
+	before := mustRun(t, f.local, "rev-parse", "HEAD")
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_unavailable" {
+		t.Fatalf("missing recorded object = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != before {
+		t.Fatalf("missing recorded object moved HEAD to %s", got)
+	}
+	if f.custodyReturned() {
+		t.Fatal("missing recorded object stamped custody")
+	}
+}
+
+func TestRecoverRejectsNonCommitHeldObject(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunCancelled)
+	blobPath := filepath.Join(t.TempDir(), "held-blob")
+	mustWrite(t, blobPath, "not a commit\n")
+	nonCommit := mustRun(t, f.gate, "hash-object", "-w", blobPath)
+	mustRun(t, f.gate, "update-ref", custody.HoldRef(f.run.ID), nonCommit)
+	before := mustRun(t, f.local, "rev-parse", "HEAD")
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_stale_head" {
+		t.Fatalf("non-commit held object = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != before {
+		t.Fatalf("non-commit held object moved HEAD to %s", got)
+	}
+	if f.custodyReturned() {
+		t.Fatal("non-commit held object stamped custody")
+	}
 }
 
 // TestTerminalPrePushRunSurfacesGuardedCustodyRecovery is the regression test
