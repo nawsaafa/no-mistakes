@@ -156,6 +156,7 @@ The CI monitor stays live in the background after checks pass, and when it sees 
 A PR that is merely behind but still clean needs nothing either, since the platform merges it.
 The one exception is when that monitor is no longer running - the PR was closed, the run was aborted or superseded, it idle-timed-out, or its auto-fix attempts were exhausted - in which case the agent recovers with `no-mistakes rerun`, which cancels the stale monitor and re-runs the full pipeline including a deterministic rebase step.
 The agent must not use `no-mistakes axi run` to refresh a still-active PR: after `checks-passed` it reattaches to the running monitor with HEAD unchanged and returns the monitor output without rebasing.
+If a CI monitor is still `running` because its reader keeps failing, an independently verified forge result may close it with `no-mistakes axi ci-close --run <id> --evidence "..." --evidence-by "..."`; both the observed result and its supplier are required and retained in the CI step record. Never use an evidence-free override, `abort`, or a rerun to manufacture a green result.
 
 In task-first mode, if the repo is on the default branch, the skill tells the agent to create a feature branch before committing because the gate validates committed history on a non-default branch.
 The agent should inspect `git status` before changing or committing anything, preserve unrelated pre-existing uncommitted changes, and commit only the changes that belong to the user's task.
@@ -169,14 +170,16 @@ no-mistakes axi sync --check
 no-mistakes axi sync
 no-mistakes axi sync --recover
 no-mistakes axi respond --action approve
+no-mistakes axi ci-close --run <id> --evidence "GitHub checks green at <sha>" --evidence-by "supervisor"
 no-mistakes axi logs --step review --full
 no-mistakes axi abort
 no-mistakes axi abort --run <id>
 ```
 
-Before any post-pipeline local commit or fresh run, read `branch_sync`.
+Before any post-pipeline local commit or fresh run, read `branch_sync`, including its primary `next_action` and any explicit `alternatives`.
 Only when its structured `next_action.code` is `sync`, run `no-mistakes axi sync` first.
-When `next_action.code` is `recover_custody` - a terminal run left unpublished pipeline commits preserved in the local gate - run `no-mistakes axi sync --recover` to return custody, or `no-mistakes rerun` to resume validating the preserved head.
+When `next_action.code` is `recover_custody` - a terminal run left unpublished pipeline commits preserved in the local gate - run `no-mistakes axi sync --recover` to return custody, or follow the structured `rerun_pipeline` alternative to resume validating the preserved head.
+Only when a refused recovery explicitly offers `release_unreachable_custody`, run `no-mistakes axi sync --release-branch`; its guard proves recovery unreachable before stamping custody returned without moving a worktree or Git ref.
 A `branch_sync.state` of `user_owned` means the run went terminal before changing the submitted head and cancellation released the branch: it is immediately usable and needs no sync action.
 When `next_action.code` is `continue_active_run`, run the reported command and keep driving the active run.
 If synchronization is blocked, process that state instead of improvising reset, stash, merge, rebase, force, or branch replacement.
@@ -260,9 +263,9 @@ For review-fixer reuse, Claude starts a stream-json session and resumes it with 
 
 ## Codex
 
-Spawns a `codex` subprocess for each invocation with `exec --json`. When structured output is requested, no-mistakes also writes a normalized schema file and passes it with `--output-schema`. By default it also adds `--dangerously-bypass-approvals-and-sandbox`, unless you already set your own Codex approval or sandbox flag through `agent_args_override`. Reads JSONL events. Structured output is returned from the final `agent_message` text, with fallback parsing that accepts JSON fences, inline fence markers, or a final bare JSON object after prose, then validates the result against the normalized schema.
+Spawns a `codex` subprocess for each invocation with `exec --json`. The prompt is sent as text on stdin through Codex's documented `-` prompt marker rather than placed in the process arguments, so a large review prompt cannot exceed the operating system's argument-size limit. When structured output is requested, no-mistakes also writes a normalized schema file and passes it with `--output-schema`. By default it also adds `--dangerously-bypass-approvals-and-sandbox`, unless you already set your own Codex approval or sandbox flag through `agent_args_override`. Reads JSONL events. Structured output is returned from the final `agent_message` text, with fallback parsing that accepts JSON fences, inline fence markers, or a final bare JSON object after prose, then validates the result against the normalized schema.
 Codex model and config overrides, such as `-m gpt-5.4`, `-c service_tier="priority"`, or `-c model_reasoning_effort="low"`, belong in global `agent_args_override.codex`.
-For review-fixer reuse, Codex resumes the reported thread with `codex exec resume <id> <prompt>`.
+For review-fixer reuse, Codex resumes the reported thread with `codex exec resume <id> -`, again with the prompt on stdin.
 That resume command has a narrower flag surface than `codex exec`, so a resume that rejects an override falls back to a fresh fixer session rather than skipping the fix turn.
 
 ## Rovo Dev

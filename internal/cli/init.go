@@ -41,13 +41,9 @@ func newInitCmd() *cobra.Command {
 					return fmt.Errorf("init: %w", err)
 				}
 				if err := daemon.EnsureDaemon(p); err != nil {
-					// Only roll back a gate we created in this run; a re-init
-					// must never eject a user's pre-existing gate.
-					if created {
-						if _, ejectErr := gate.Eject(cmd.Context(), d, p, "."); ejectErr != nil {
-							return fmt.Errorf("start daemon: %w, rollback init: %v", err, ejectErr)
-						}
-					}
+					// Init is idempotent and eject no longer deletes anything, so
+					// a gate created in this run is left in place: a retry
+					// repairs and reuses the same gate instead of rolling it back.
 					return fmt.Errorf("start daemon: %w", err)
 				}
 

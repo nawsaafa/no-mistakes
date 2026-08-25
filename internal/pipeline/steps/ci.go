@@ -2,6 +2,7 @@ package steps
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/cimonitor"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -17,6 +19,14 @@ import (
 const (
 	defaultBaseBranchTipResolveWindow = 30 * time.Second
 	defaultPublishedHeadResolveWindow = 30 * time.Second
+
+	// ciReaderErrorParkThreshold is the number of consecutive GetChecks read
+	// failures the CI monitor tolerates before parking for a decision. A single
+	// flaky poll is not escalated - the poll loop just retries at the normal
+	// cadence - but a reader that keeps erroring can otherwise stall a run for
+	// its entire (possibly unlimited) CITimeout with no reachable skip, because
+	// the step never parks and axi respond only acts on a parked step.
+	ciReaderErrorParkThreshold = 3
 )
 
 // CI monitoring status messages. These are surfaced to the user and parsed by
@@ -42,6 +52,8 @@ type CIStep struct {
 	ciFixAttempts        int                  // number of CI auto-fix attempts made
 	transientReruns      checkRerunBudget     // per-check rerun budget spent on provider-reported transient failures
 	pollIntervalOverride time.Duration        // if set, overrides computed poll interval (for testing)
+	readerErrorStreak    int                  // consecutive GetChecks failures since the last successful read
+	lastReaderErr        string               // redacted text of the most recent GetChecks failure
 	waitForNextPoll      func(context.Context, time.Duration) error
 	now                  func() time.Time
 	// baseBranchTip resolves the current tip SHA of the upstream default
@@ -122,6 +134,15 @@ func (s *CIStep) ReconcileApprovalGate(sctx *pipeline.StepContext) (bool, error)
 func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 	if err := assertPipelineHeadContinuity(sctx, s.Name()); err != nil {
 		return nil, err
+	}
+	// A new execution round starts a new reader observation window. Any close
+	// request left over from a prior round must not be allowed to certify this
+	// round before it performs a fresh provider read.
+	discardExternalCIClose(sctx)
+	s.readerErrorStreak = 0
+	s.lastReaderErr = ""
+	if sctx.SetCIExternalCloseReady != nil {
+		sctx.SetCIExternalCloseReady(false)
 	}
 	// A run recovered after a restart resumes the rerun budget it already
 	// spent. Without this the fresh in-memory budget would grant reruns the
@@ -216,6 +237,9 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 	}
 
 	for {
+		if evidence, ok := receiveExternalCIClose(sctx); ok {
+			return externalCICloseOutcome(evidence), nil
+		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -303,7 +327,26 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			clearCIMonitorReady(sctx)
 			lastMonitorLog = ""
 			sctx.Log(fmt.Sprintf("warning: could not check CI: %v", err))
+			s.readerErrorStreak++
+			s.lastReaderErr = safeurl.RedactText(err.Error())
+			if sctx.SetCIExternalCloseReady != nil {
+				sctx.SetCIExternalCloseReady(s.readerErrorStreak >= ciReaderErrorParkThreshold)
+			}
+			// A close request wins over the reader-error park. The request is
+			// specifically for a monitor that is still running, and must not
+			// become stranded behind the approval gate it was meant to bypass.
+			if evidence, ok := receiveExternalCIClose(sctx); ok {
+				return externalCICloseOutcome(evidence), nil
+			}
+			if s.readerErrorStreak >= ciReaderErrorParkThreshold {
+				return ciReaderErrorOutcome(s.readerErrorStreak, s.lastReaderErr), nil
+			}
 		} else {
+			s.readerErrorStreak = 0
+			s.lastReaderErr = ""
+			if sctx.SetCIExternalCloseReady != nil {
+				sctx.SetCIExternalCloseReady(false)
+			}
 			// checksPending is the narrow execution state: only checks that are
 			// actively running or queued block a rerun or issue escalation. A
 			// provider-cancelled check is terminal enough to enter the transient
@@ -533,6 +576,16 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			}
 		}
 		waitForNextPoll := s.waitForNextPoll
+		if waitForNextPoll == nil && sctx.CIExternalClose != nil {
+			select {
+			case evidence := <-sctx.CIExternalClose:
+				return externalCICloseOutcome(evidence), nil
+			case <-time.After(interval):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			continue
+		}
 		if waitForNextPoll == nil {
 			waitForNextPoll = func(ctx context.Context, interval time.Duration) error {
 				select {
@@ -565,6 +618,50 @@ func clearCIMonitorReady(sctx *pipeline.StepContext) {
 	if err := setCIMonitorReadiness(sctx, false, false); err != nil {
 		sctx.Log(fmt.Sprintf("warning: could not clear CI readiness: %v", err))
 	}
+}
+
+func discardExternalCIClose(sctx *pipeline.StepContext) {
+	if sctx == nil || sctx.CIExternalClose == nil {
+		return
+	}
+	for {
+		select {
+		case <-sctx.CIExternalClose:
+			// Deliberately discard evidence that crossed an execution-round
+			// boundary. It was observed against an earlier monitor state and
+			// cannot certify the fresh round.
+		default:
+			return
+		}
+	}
+}
+
+func receiveExternalCIClose(sctx *pipeline.StepContext) (types.ExternalEvidence, bool) {
+	if sctx == nil || sctx.CIExternalClose == nil {
+		return types.ExternalEvidence{}, false
+	}
+	select {
+	case evidence := <-sctx.CIExternalClose:
+		return evidence, true
+	default:
+		return types.ExternalEvidence{}, false
+	}
+}
+
+func externalCICloseOutcome(evidence types.ExternalEvidence) *pipeline.StepOutcome {
+	evidence.What = safeurl.RedactText(strings.TrimSpace(evidence.What))
+	evidence.SuppliedBy = strings.TrimSpace(evidence.SuppliedBy)
+	findings := types.Findings{
+		Summary:          "CI monitor closed with externally supplied forge evidence",
+		ExternalEvidence: &evidence,
+	}
+	raw, err := json.Marshal(findings)
+	if err != nil {
+		// The evidence fields are strings and therefore cannot fail to marshal;
+		// retain a truthful, minimal payload if a future schema change does.
+		raw = []byte(`{"findings":[],"summary":"CI monitor closed with external evidence"}`)
+	}
+	return &pipeline.StepOutcome{Findings: string(raw), ExitCode: 0}
 }
 
 func setCIMonitorReadiness(sctx *pipeline.StepContext, ready, declaredNoCI bool) error {

@@ -350,7 +350,7 @@ func runHappyPath(t *testing.T, agentName string) {
 	}
 	assertEjectOutput(t, h, out)
 	assertOutputDoesNotContainPath(t, out, initWorktree, "eject from worktree")
-	assertGateRemoteAbsent(t, h)
+	assertGateRemotePresent(t, h)
 }
 
 func cleanReviewScenario(t *testing.T) string {
@@ -850,7 +850,7 @@ func assertEjectOutput(t *testing.T, h *Harness, out string) {
 	if path, err := filepath.EvalSymlinks(h.WorkDir); err == nil {
 		resolved = path
 	}
-	for _, want := range []string{resolved, "Gate removed"} {
+	for _, want := range []string{resolved, "does not remove gates automatically", "git remote remove"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("eject output should contain %q, got:\n%s", want, out)
 		}
@@ -2571,14 +2571,6 @@ func assertGateRemotePresent(t *testing.T, h *Harness) {
 	want := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
 	if strings.TrimSpace(string(out)) != want {
 		t.Errorf("no-mistakes remote URL = %q, want %q", strings.TrimSpace(string(out)), want)
-	}
-}
-
-func assertGateRemoteAbsent(t *testing.T, h *Harness) {
-	t.Helper()
-	out, err := h.runGit(context.Background(), h.WorkDir, "remote", "get-url", "no-mistakes")
-	if err == nil {
-		t.Fatalf("no-mistakes remote should have been removed after eject, got %s", out)
 	}
 }
 

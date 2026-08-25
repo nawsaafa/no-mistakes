@@ -929,7 +929,10 @@ func TestInitDetectsDefaultBranchFromRemote(t *testing.T) {
 	}
 }
 
-func TestEject(t *testing.T) {
+// TestEjectDoesNotRemoveAnything verifies that Eject is read-only: Git
+// remains the sole custody authority, so no-mistakes never deletes the bare
+// gate repo, its worktrees, its remote, or its database record on its own.
+func TestEjectDoesNotRemoveAnything(t *testing.T) {
 	workDir := setupTestRepo(t)
 	nmRoot := t.TempDir()
 	p := paths.WithRoot(nmRoot)
@@ -943,62 +946,43 @@ func TestEject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
-
-	if _, err := Eject(ctx, d, p, workDir); err != nil {
-		t.Fatalf("eject: %v", err)
-	}
-
-	// Verify remote was removed.
-	_, err = gitpkg.GetRemoteURL(ctx, workDir, "no-mistakes")
-	if err == nil {
-		t.Error("expected no-mistakes remote to be removed")
-	}
-
-	// Verify bare repo was deleted.
-	bareDir := p.RepoDir(repo.ID)
-	if fileExists(bareDir) {
-		t.Error("expected bare repo to be deleted")
-	}
-
-	// Verify DB record was deleted.
-	dbRepo, err := d.GetRepoByPath(workDir)
-	if err != nil {
-		t.Fatalf("get repo: %v", err)
-	}
-	if dbRepo != nil {
-		t.Error("expected repo to be deleted from DB")
-	}
-}
-
-func TestEjectCleansUpWorktrees(t *testing.T) {
-	workDir := setupTestRepo(t)
-	nmRoot := t.TempDir()
-	p := paths.WithRoot(nmRoot)
-	if err := p.EnsureDirs(); err != nil {
-		t.Fatalf("ensure dirs: %v", err)
-	}
-	d := openTestDB(t, p)
-	ctx := context.Background()
-
-	repo, _, err := Init(ctx, d, p, workDir)
-	if err != nil {
-		t.Fatalf("init: %v", err)
-	}
-
-	// Create a fake worktree directory to verify cleanup.
 	wtDir := p.WorktreeDir(repo.ID, "fake-run-id")
 	if err := os.MkdirAll(wtDir, 0o755); err != nil {
 		t.Fatalf("create worktree dir: %v", err)
 	}
 
-	if _, err := Eject(ctx, d, p, workDir); err != nil {
+	got, err := Eject(ctx, d, p, workDir)
+	if err != nil {
 		t.Fatalf("eject: %v", err)
 	}
+	if got.ID != repo.ID {
+		t.Errorf("eject reported repo ID %q, want %q", got.ID, repo.ID)
+	}
 
-	// Verify worktree directory was cleaned up.
-	repoWtDir := filepath.Join(p.WorktreesDir(), repo.ID)
-	if fileExists(repoWtDir) {
-		t.Error("expected worktree directory to be cleaned up")
+	// Verify remote survived.
+	if url, err := gitpkg.GetRemoteURL(ctx, workDir, "no-mistakes"); err != nil {
+		t.Errorf("no-mistakes remote must survive eject: %v", err)
+	} else if url != p.RepoDir(repo.ID) {
+		t.Errorf("remote url = %q, want %q", url, p.RepoDir(repo.ID))
+	}
+
+	// Verify bare repo survived.
+	if !fileExists(p.RepoDir(repo.ID)) {
+		t.Error("bare gate repo must survive eject")
+	}
+
+	// Verify worktree directory survived.
+	if !fileExists(wtDir) {
+		t.Error("worktree directory must survive eject")
+	}
+
+	// Verify DB record survived.
+	dbRepo, err := d.GetRepoByPath(workDir)
+	if err != nil {
+		t.Fatalf("get repo: %v", err)
+	}
+	if dbRepo == nil {
+		t.Error("expected repo record to survive eject")
 	}
 }
 

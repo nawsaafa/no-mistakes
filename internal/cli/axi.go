@@ -45,6 +45,7 @@ func newAxiCmd() *cobra.Command {
 
 	cmd.AddCommand(newAxiRunCmd())
 	cmd.AddCommand(newAxiRespondCmd())
+	cmd.AddCommand(newAxiCICloseCmd())
 	cmd.AddCommand(newAxiStatusCmd())
 	cmd.AddCommand(newAxiSyncCmd())
 	cmd.AddCommand(newAxiLogsCmd())
@@ -92,6 +93,10 @@ func openAxiDaemonEnv() (*axiEnv, error) {
 
 func openAxiRunEnv() (*axiEnv, error) {
 	return openAxiDaemonEnv()
+}
+
+func openAxiExplicitRunDaemonEnv(runID string) (*axiEnv, error) {
+	return openAxiEnvWithOptions(axiEnvOptions{ensureDaemonConn: true, explicitRunID: strings.TrimSpace(runID), deferGlobalConfigErrorForRunningDaemon: true})
 }
 
 func openAxiEnvWithOptions(opts axiEnvOptions) (*axiEnv, error) {

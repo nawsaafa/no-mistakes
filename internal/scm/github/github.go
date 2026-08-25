@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/safeurl"
 	"github.com/kunchenguid/no-mistakes/internal/scm"
 )
 
@@ -297,16 +298,20 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 	if err != nil {
 		return nil, err
 	}
+	// `gh pr view --json statusCheckRollup` exposes the GraphQL union directly.
+	// Its CheckRun and StatusContext members do not share a conclusive field;
+	// in practice third-party commit status contexts can arrive with a null
+	// conclusion even while `gh pr checks` correctly reports them as passing.
+	// Use gh's normalized projection so both kinds participate in readiness.
 	args := append([]string{"pr", "checks", selector}, h.repoArgs()...)
 	args = append(args, "--json", "name,state,bucket,completedAt,link")
 	cmd := h.cmd(ctx, "gh", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		if strings.Contains(string(out), "no checks reported") {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("gh pr checks: %w", err)
-	}
+	// gh uses its exit status as a verdict: pending and failing checks are
+	// non-zero even though stdout contains the complete JSON observation. Read
+	// stdout independently of that status; only an unparseable payload is a
+	// reader failure. Output() also preserves stderr on ExitError for the real
+	// command-failure diagnostic below.
+	out, err := cmd.Output()
 	var raw []struct {
 		Name        string `json:"name"`
 		State       string `json:"state"`
@@ -314,36 +319,63 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 		CompletedAt string `json:"completedAt"`
 		Link        string `json:"link"`
 	}
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, fmt.Errorf("parse CI checks: %w", err)
+	parseErr := json.Unmarshal(out, &raw)
+	if parseErr != nil {
+		failureOutput := commandFailureOutput(out, err)
+		if strings.Contains(string(failureOutput), "no checks reported") {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("gh pr checks: %s: %w", boundedCommandOutput(failureOutput), err)
+		}
+		return nil, fmt.Errorf("parse CI checks: %w", parseErr)
 	}
 	checks := make([]scm.Check, 0, len(raw))
 	for _, r := range raw {
-		var completedAt time.Time
-		if r.CompletedAt != "" {
-			if parsed, parseErr := time.Parse(time.RFC3339, r.CompletedAt); parseErr == nil {
-				completedAt = parsed
-			}
-		}
 		checks = append(checks, scm.Check{
-			Name:        r.Name,
+			Name:        strings.TrimSpace(r.Name),
 			Bucket:      normalizeCheckBucket(r.Bucket, r.State),
 			State:       strings.ToUpper(strings.TrimSpace(r.State)),
-			CompletedAt: completedAt,
+			CompletedAt: parseGitHubTime(r.CompletedAt),
 			Link:        strings.TrimSpace(r.Link),
 		})
 	}
 	return checks, nil
 }
 
+func parseGitHubTime(raw string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	return parsed
+}
+
+const maxGitHubCommandOutput = 4096
+
+func commandFailureOutput(stdout []byte, err error) []byte {
+	if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+		combined := make([]byte, 0, len(stdout)+len(exitErr.Stderr))
+		combined = append(combined, stdout...)
+		combined = append(combined, exitErr.Stderr...)
+		return combined
+	}
+	return stdout
+}
+
+func boundedCommandOutput(out []byte) string {
+	text := strings.TrimSpace(safeurl.RedactText(string(out)))
+	if len(text) > maxGitHubCommandOutput {
+		return text[:maxGitHubCommandOutput] + "...[truncated]"
+	}
+	return text
+}
+
 // RerunCheck re-runs the Actions job behind check for the same commit, so a
 // check the provider cancelled rather than failed can be retried without a new
-// push. The job is identified from the check's details link, which is the only
-// run/job identity `gh pr checks` reports: a link naming a job re-runs just that
-// job (and its dependencies), and a link naming only a run re-runs that run's
-// failed jobs. Anything else - a third-party status pointing at an external
-// dashboard, or a run path this backend cannot read - names no re-runnable job,
-// and the error says so rather than falling back to a wider rerun.
+// push. The job is identified from the CheckRun details URL in the PR status
+// rollup: a link naming a job re-runs just that job (and its dependencies), and
+// a link naming only a run re-runs that run's failed jobs. Anything else - a
+// third-party status pointing at an external dashboard, or a run path this
+// backend cannot read - names no re-runnable job, and the error says so rather
+// than falling back to a wider rerun.
 func (h *Host) RerunCheck(ctx context.Context, _ *scm.PR, check scm.Check) error {
 	rerunArgs, ok := rerunTargetArgs(check.Link)
 	if !ok {

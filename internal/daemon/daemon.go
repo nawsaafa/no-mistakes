@@ -17,6 +17,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/custody"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/gatecontext"
 	"github.com/kunchenguid/no-mistakes/internal/git"
@@ -407,54 +408,49 @@ func recoverOnStartup(d *db.DB, p *paths.Paths, mgr *RunManager) {
 	mgr.resumeRecoveredRuns(plans)
 }
 
-// cleanupOrphanWorktrees removes worktree directories left behind by runs
-// that are no longer active. It is DB-aware: a worktree is only removed when
-// its run row is terminal, or when there is no matching run row at all.
-// This is what keeps cleanup from deleting the checkout out from under a
-// pipeline that is still actually running (see skipWorktreeCleanup).
-// Called from recoverOnStartup after
-// RecoverStaleRuns, so in the normal single-daemon path every run this loop
-// sees has already been resolved to a terminal status; it is factored out
-// separately so it can also be exercised - and its DB-aware skip behavior
-// verified - independent of stale-run recovery's side effects.
+// cleanupOrphanWorktrees removes worktrees left behind by runs that are no
+// longer active. It is registration-first: the set of worktrees to consider
+// comes from each gate's own git worktree list --porcelain, never a
+// filesystem walk, so a directory that was already deleted (but not yet
+// pruned) or a stray directory git never registered cannot influence what
+// gets removed. It is also DB-aware: a worktree is only removed when its run
+// row is terminal, or when there is no matching run row at all. This is what
+// keeps cleanup from deleting the checkout out from under a pipeline that is
+// still actually running (see skipWorktreeCleanup). Removal always routes
+// through the custody guard; there is no raw-directory-delete fallback, so a
+// failed anchor or removal simply retains the worktree for the next startup.
+// Called from recoverOnStartup after RecoverStaleRuns, so in the normal
+// single-daemon path every run this loop sees has already been resolved to a
+// terminal status.
 func cleanupOrphanWorktrees(d *db.DB, p *paths.Paths) {
-	wtRoot := p.WorktreesDir()
-	entries, err := os.ReadDir(wtRoot)
-	if err != nil {
-		return // directory may not exist yet
-	}
 	ctx := context.Background()
-	for _, repoEntry := range entries {
-		if !repoEntry.IsDir() {
-			continue
-		}
-		repoPath := filepath.Join(wtRoot, repoEntry.Name())
-		gateDir := p.RepoDir(repoEntry.Name())
-		runEntries, err := os.ReadDir(repoPath)
+	repos, err := d.GetRepos()
+	if err != nil {
+		slog.Warn("failed to list repos for worktree cleanup", "error", err)
+		return
+	}
+	for _, repo := range repos {
+		gateDir := p.RepoDir(repo.ID)
+		entries, err := git.WorktreeList(ctx, gateDir)
 		if err != nil {
+			slog.Warn("failed to list registered worktrees", "gate", gateDir, "error", err)
 			continue
 		}
-		for _, runEntry := range runEntries {
-			if !runEntry.IsDir() {
+		for _, e := range entries {
+			if e.Bare {
 				continue
 			}
-			runID := runEntry.Name()
-			wtPath := filepath.Join(repoPath, runID)
+			runID := filepath.Base(e.Path)
 			if skip, reason := skipWorktreeCleanup(d, runID); skip {
-				slog.Info("skipping worktree cleanup", "path", wtPath, "reason", reason)
+				slog.Info("skipping worktree cleanup", "path", e.Path, "reason", reason)
 				continue
 			}
-			if err := git.WorktreeRemove(ctx, gateDir, wtPath); err != nil {
-				slog.Warn("git worktree remove failed, falling back to os.RemoveAll", "path", wtPath, "error", err)
-				if err := os.RemoveAll(wtPath); err != nil {
-					slog.Warn("failed to remove orphaned worktree", "path", wtPath, "error", err)
-				}
-			} else {
-				slog.Info("removed orphaned worktree", "path", wtPath)
+			if err := custody.AnchorAndRemoveRunWorktree(ctx, gateDir, e.Path, runID); err != nil {
+				slog.Warn("failed to remove orphaned worktree", "path", e.Path, "error", err)
+				continue
 			}
+			slog.Info("removed orphaned worktree", "path", e.Path)
 		}
-		// Remove empty repo dir.
-		os.Remove(repoPath)
 	}
 }
 
@@ -789,6 +785,21 @@ func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func(
 			return nil, err
 		}
 		return &ipc.RespondResult{OK: true}, nil
+	})
+
+	srv.Handle(ipc.MethodCloseCI, func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+		if err := refuseNested(ctx, false); err != nil {
+			return nil, err
+		}
+		var p ipc.CloseCIParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		evidence := types.ExternalEvidence{What: p.What, SuppliedBy: p.SuppliedBy}
+		if err := mgr.HandleCloseCI(p.RunID, evidence); err != nil {
+			return nil, err
+		}
+		return &ipc.CloseCIResult{OK: true}, nil
 	})
 
 	srv.Handle(ipc.MethodCancelRun, func(ctx context.Context, params json.RawMessage) (interface{}, error) {

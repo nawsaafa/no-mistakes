@@ -40,7 +40,7 @@ Once the host is wired up, `no-mistakes` can keep owning the branch after it
 pushes to the configured target:
 
 - create or update the PR automatically
-- keep polling hosted CI until the PR is merged, closed, declined, or the configured `ci_timeout` idle window elapses
+- keep polling hosted CI while the PR remains active, subject to the [CI step's monitoring and approval rules](/no-mistakes/reference/pipeline-steps/#ci)
 - fetch failing job logs for the CI auto-fix loop
 - on GitHub, GitLab, and Azure DevOps, watch mergeability and fix merge conflicts when possible
 
@@ -70,7 +70,7 @@ For PR and workflow-run commands, no-mistakes passes the repository slug from th
 **What you get:**
 
 - PR creation and update on pushes
-- CI check polling with exponential backoff (30s → 60s → 120s) until the PR is merged, closed, or the configured `ci_timeout` idle window elapses
+- CI check polling with exponential backoff (30s → 60s → 120s), subject to the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed job log fetching (`gh run view --log-failed`) for the CI auto-fix step
 - PR mergeability polling, and agent-driven resolution when the provider reports an actual merge conflict
 
@@ -108,7 +108,7 @@ glab auth login
 **What you get:**
 
 - PR (merge request) creation and update
-- CI pipeline status polling until the merge request is merged, closed, or the configured `ci_timeout` idle window elapses
+- CI pipeline status polling, subject to the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed job trace fetching (`glab ci trace`) for the CI auto-fix step
 - Merge-conflict polling and auto-fix, same as GitHub
 
@@ -129,7 +129,7 @@ Get an API token from [Bitbucket account settings](https://bitbucket.org/account
 **What you get:**
 
 - PR creation and update
-- CI pipeline status polling until the PR is merged, declined, or the configured `ci_timeout` idle window elapses
+- CI pipeline status polling, subject to the [CI step reference](/no-mistakes/reference/pipeline-steps/#ci)
 - Failed pipeline step log fetching for the CI auto-fix step
 
 **What you don't get (yet):**
@@ -175,8 +175,8 @@ well as their SSH forms (`git@ssh.dev.azure.com:v3/...`).
   See the [PR step reference](/no-mistakes/reference/pipeline-steps/#pr) for
   section ownership and truncation behavior.
 - CI status polling - Azure branch policy evaluations (build validation and
-  status checks) are read via `az repos pr policy list` until the PR is
-  completed, abandoned, or the configured `ci_timeout` idle window elapses
+  status checks) are read via `az repos pr policy list`, subject to the [CI
+  step reference](/no-mistakes/reference/pipeline-steps/#ci)
 - Merge-conflict polling and auto-fix from the PR's `mergeStatus`
 
 **What you don't get (yet):**

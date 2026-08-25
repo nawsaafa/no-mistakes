@@ -421,7 +421,8 @@ func newTestContextWithDBRecords(t *testing.T, ag agent.Agent, workDir, baseSHA,
 }
 
 // fakeCIGH creates a fake gh binary that responds to CI-related
-// commands (pr view --json state, pr checks --json, pr view --json comments).
+// commands (pr view --json state, pr checks --json name,state,bucket,completedAt,link,
+// pr view --json comments).
 func fakeCIGH(t *testing.T, state, checksJSON string) []string {
 	t.Helper()
 	binDir := fakeCLIBinDir(t)

@@ -308,7 +308,7 @@ func fakeCIGHReconcileHandler(args []string) {
 		fmt.Println("MERGEABLE")
 		os.Exit(0)
 	}
-	if strings.Contains(joined, "pr checks") {
+	if strings.Contains(joined, "pr checks") && strings.Contains(joined, "--json name,state,bucket,completedAt,link") {
 		fmt.Println(`[{"name":"build","state":"SUCCESS","bucket":"pass"}]`)
 		os.Exit(0)
 	}
@@ -347,10 +347,13 @@ func fakeCIGHHandler(args []string) {
 		fmt.Println(state)
 		os.Exit(0)
 	}
-	if strings.Contains(joined, "pr checks") {
+	if strings.Contains(joined, "pr checks") && strings.Contains(joined, "--json name,state,bucket,completedAt,link") {
 		if checksErr != "" {
 			fmt.Fprintln(os.Stderr, checksErr)
 			os.Exit(1)
+		}
+		if checksJSON == "" {
+			checksJSON = "[]"
 		}
 		fmt.Println(checksJSON)
 		os.Exit(0)
@@ -401,7 +404,7 @@ func fakeCIGHSequenceHandler(args []string) {
 		fmt.Println(state)
 		os.Exit(0)
 	}
-	if strings.Contains(joined, "pr checks") {
+	if strings.Contains(joined, "pr checks") && strings.Contains(joined, "--json name,state,bucket,completedAt,link") {
 		data, err := os.ReadFile(checksPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -409,7 +412,7 @@ func fakeCIGHSequenceHandler(args []string) {
 		}
 		entries := strings.Split(strings.TrimSpace(string(data)), "\n")
 		if len(entries) == 0 || entries[0] == "" {
-			fmt.Println("[]")
+			fmt.Println(`[]`)
 			os.Exit(0)
 		}
 
@@ -559,9 +562,9 @@ func fakeCIGHNoChecksHandler(args []string) {
 	if len(args) >= 2 && args[0] == "auth" && args[1] == "status" {
 		os.Exit(0)
 	}
-	if strings.Contains(joined, "pr checks") {
-		fmt.Fprintln(os.Stderr, "no checks reported on the 'feature/e2e' branch")
-		os.Exit(1)
+	if strings.Contains(joined, "pr checks") && strings.Contains(joined, "--json name,state,bucket,completedAt,link") {
+		fmt.Println(`[]`)
+		os.Exit(0)
 	}
 	if strings.Contains(joined, "pr view") && strings.Contains(joined, "--json state") {
 		fmt.Println("OPEN")

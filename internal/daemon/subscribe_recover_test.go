@@ -686,18 +686,27 @@ func TestRecoverCleansUpOrphanedWorktrees(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create orphaned worktree directories.
-	orphanDir := p.WorktreeDir("some-repo", "some-run")
-	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	os.WriteFile(filepath.Join(orphanDir, "test.txt"), []byte("orphan"), 0o644)
-
 	d, err := db.Open(p.DB())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { d.Close() })
+
+	// A registered but terminal run's worktree: registration-first cleanup
+	// only considers worktrees git itself knows about for a registered repo,
+	// so this must be a real worktree, not a bare directory.
+	repo, headSHA := setupTestGitRepo(t, p, d, "some-repo")
+	orphanRun, err := d.InsertRun(repo.ID, "old-branch", headSHA, headSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRunStatus(orphanRun.ID, types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	orphanDir := p.WorktreeDir(repo.ID, orphanRun.ID)
+	if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repo.ID), orphanDir, headSHA); err != nil {
+		t.Fatal(err)
+	}
 
 	errCh := make(chan error, 1)
 	go func() {

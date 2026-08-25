@@ -16,7 +16,7 @@ import (
 var syncInteractive = terminalInteractive
 
 func newSyncCmd() *cobra.Command {
-	var check, yes, recover, keepLocal bool
+	var check, yes, recover, keepLocal, releaseBranch bool
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Safely move the current branch to an exact pipeline-pushed head",
@@ -28,12 +28,15 @@ func newSyncCmd() *cobra.Command {
 			"merges genuine divergence, rebases, switches branches, or updates a remote.\n" +
 			"--check performs the fresh proof without applying it.\n" +
 			"--recover returns custody of a branch whose run went terminal with unpublished\n" +
-			"pipeline commits: it anchors the preserved head, then either fast-forwards a\n" +
+			"pipeline commits: it prefers the run-scoped custody hold over a stale cached\n" +
+			"head, anchors the verified preserved tip, then either fast-forwards a\n" +
 			"clean behind worktree or adopts a diverged preserved head only when proven to\n" +
 			"carry every local change. Unproven divergence refuses. A run cancelled before\n" +
 			"the pipeline changed anything releases the branch by itself (user_owned) and\n" +
 			"makes --recover a no-op. --recover --keep-local keeps the current local head\n" +
-			"instead and never touches the worktree.",
+			"instead and never touches the worktree. When recovery proves its exact gate-head\n" +
+			"guard unreachable, --release-branch can return custody without moving any file\n" +
+			"or Git ref.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if check && yes {
@@ -42,11 +45,17 @@ func newSyncCmd() *cobra.Command {
 			if check && recover {
 				return &exitError{code: 2, err: fmt.Errorf("--check and --recover cannot be used together")}
 			}
+			if releaseBranch && (check || recover || keepLocal) {
+				return &exitError{code: 2, err: fmt.Errorf("--release-branch cannot be combined with --check, --recover, or --keep-local")}
+			}
 			if keepLocal && !recover {
 				return &exitError{code: 2, err: fmt.Errorf("--keep-local requires --recover")}
 			}
 			if recover {
 				return runHumanRecover(cmd, keepLocal, yes)
+			}
+			if releaseBranch {
+				return runHumanRelease(cmd, yes)
 			}
 			return runHumanSync(cmd, check, yes)
 		},
@@ -55,11 +64,12 @@ func newSyncCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "apply an eligible guarded synchronization without prompting")
 	cmd.Flags().BoolVar(&recover, "recover", false, "return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch)")
 	cmd.Flags().BoolVar(&keepLocal, "keep-local", false, "with --recover: keep the current local head; the preserved commits stay anchored and the gate follows the kept head")
+	cmd.Flags().BoolVar(&releaseBranch, "release-branch", false, "release custody only when a terminal run's preserved head provably cannot pass guarded recovery")
 	return cmd
 }
 
 func newAxiSyncCmd() *cobra.Command {
-	var check, recover, keepLocal bool
+	var check, recover, keepLocal, releaseBranch bool
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Check or apply guarded current-branch synchronization",
@@ -71,7 +81,9 @@ func newAxiSyncCmd() *cobra.Command {
 			"verified pipeline head with reset semantics.\n" +
 			"--check performs the same fresh read-only plan. Blocked states change nothing.\n" +
 			"--recover performs the guarded custody return offered by\n" +
-			"next_action.code: recover_custody; --keep-local keeps the current local head.",
+			"next_action.code: recover_custody; --keep-local keeps the current local head.\n" +
+			"--release-branch stamps custody returned only after the exact gate-head guard\n" +
+			"proves recovery unreachable; it never moves a worktree or Git ref.",
 		Args:          cobra.NoArgs,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -79,15 +91,19 @@ func newAxiSyncCmd() *cobra.Command {
 			if check && recover {
 				return emitError(cmd, 2, "--check and --recover cannot be used together")
 			}
+			if releaseBranch && (check || recover || keepLocal) {
+				return emitError(cmd, 2, "--release-branch cannot be combined with --check, --recover, or --keep-local")
+			}
 			if keepLocal && !recover {
 				return emitError(cmd, 2, "--keep-local requires --recover")
 			}
-			return runAxiSync(cmd, check, recover, keepLocal)
+			return runAxiSync(cmd, check, recover, keepLocal, releaseBranch)
 		},
 	}
 	cmd.Flags().BoolVar(&check, "check", false, "freshly verify and return the plan without changing HEAD")
 	cmd.Flags().BoolVar(&recover, "recover", false, "return custody of a branch stranded by a terminal run with unpublished pipeline commits (a no-op when cancellation already released the branch)")
 	cmd.Flags().BoolVar(&keepLocal, "keep-local", false, "with --recover: keep the current local head; the preserved commits stay anchored and the gate follows the kept head")
+	cmd.Flags().BoolVar(&releaseBranch, "release-branch", false, "release custody only when a terminal run's preserved head provably cannot pass guarded recovery")
 	return cmd
 }
 
@@ -229,6 +245,11 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 	recovered := service.Recover(cmd.Context(), keepLocal)
 	observed = recovered
 	printHumanSyncState(cmd, recovered)
+	if recovered.Safety == "blocked_recover_gate_diverged" {
+		fmt.Fprintln(cmd.OutOrStdout(), "  Ordinary recovery is unreachable at its gate-head guard. Run `no-mistakes rerun`")
+		fmt.Fprintln(cmd.OutOrStdout(), "  to resume validation, or `no-mistakes sync --release-branch` to return custody")
+		fmt.Fprintln(cmd.OutOrStdout(), "  without moving the worktree or any Git ref.")
+	}
 	if recovered.Recovered {
 		if recovered.State == branchsync.StateUserOwned {
 			fmt.Fprintln(cmd.OutOrStdout(), "  Nothing to recover; cancellation already released this branch to you.")
@@ -240,6 +261,55 @@ func runHumanRecover(cmd *cobra.Command, keepLocal, yes bool) error {
 		} else {
 			result = "noop"
 		}
+		return nil
+	}
+	result = "refused"
+	return &exitError{code: 1}
+}
+
+func runHumanRelease(cmd *cobra.Command, yes bool) error {
+	started := time.Now()
+	var observed branchsync.State
+	result := "error"
+	defer func() { trackSyncAttempt("sync", "human_cli", "release_branch", observed, result, started) }()
+
+	service, closeFn, err := openSyncService()
+	if err != nil {
+		return err
+	}
+	defer closeFn()
+
+	state := service.InspectCached(cmd.Context())
+	observed = state
+	if !yes {
+		printHumanSyncState(cmd, state)
+		if !syncInteractive() {
+			fmt.Fprintln(cmd.OutOrStdout(), "  Non-interactive input cannot confirm this release. Re-run with `no-mistakes sync --release-branch --yes`.")
+			result = "refused"
+			return &exitError{code: 1}
+		}
+		fmt.Fprintln(cmd.OutOrStdout(), "  Release is allowed only when guarded recovery proves that the terminal run's")
+		fmt.Fprintln(cmd.OutOrStdout(), "  preserved head is unreachable. It stamps custody returned without moving the")
+		fmt.Fprintln(cmd.OutOrStdout(), "  worktree, a Git ref, or a remote; every other state refuses.")
+		fmt.Fprint(cmd.OutOrStdout(), "  Release custody of this branch? [y/N] ")
+		line, readErr := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+		if readErr != nil && strings.TrimSpace(line) == "" {
+			return readErr
+		}
+		answer := strings.ToLower(strings.TrimSpace(line))
+		if answer != "y" && answer != "yes" {
+			fmt.Fprintln(cmd.OutOrStdout(), "  Cancelled; no files or refs were changed.")
+			result = "cancelled"
+			return nil
+		}
+	}
+
+	released := service.ReleaseUnreachableCustody(cmd.Context())
+	observed = released
+	printHumanSyncState(cmd, released)
+	if released.Released {
+		fmt.Fprintln(cmd.OutOrStdout(), "  Custody released; start a fresh run when ready.")
+		result = "noop"
 		return nil
 	}
 	result = "refused"
@@ -304,7 +374,7 @@ func humanSyncSummary(state branchsync.State) string {
 	}
 }
 
-func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
+func runAxiSync(cmd *cobra.Command, check, recover, keepLocal, releaseBranch bool) error {
 	started := time.Now()
 	mode := "apply"
 	switch {
@@ -314,6 +384,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 		mode = "recover_keep_local"
 	case recover:
 		mode = "recover"
+	case releaseBranch:
+		mode = "release_branch"
 	}
 	var state branchsync.State
 	result := "error"
@@ -330,6 +402,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 		state = service.Refresh(cmd.Context())
 	case recover:
 		state = service.Recover(cmd.Context(), keepLocal)
+	case releaseBranch:
+		state = service.ReleaseUnreachableCustody(cmd.Context())
 	default:
 		state = service.Apply(cmd.Context())
 	}
@@ -341,8 +415,8 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 	if state.NextAction != nil {
 		help = append(help, "Run `"+state.NextAction.Command+"`")
 	}
-	if state.Safety == "blocked_pipeline_owned_recoverable" {
-		help = append(help, "Run `no-mistakes rerun` instead to resume validating the preserved pipeline head")
+	for _, alternative := range state.Alternatives {
+		help = append(help, "Alternatively, run `"+alternative.Command+"`")
 	}
 	if len(help) > 0 {
 		fields = append(fields, toON.Field{Key: "help", Value: help})
@@ -351,6 +425,9 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool) error {
 	successful := syncStateSuccessful(state, check)
 	if recover {
 		successful = state.Recovered
+	}
+	if releaseBranch {
+		successful = state.Released
 	}
 	if successful {
 		if state.Changed {
@@ -414,6 +491,11 @@ func syncStateSuccessful(state branchsync.State, check bool) bool {
 	return check && branchsync.CanApply(state)
 }
 
+type nextActionRow struct {
+	Code    string `toon:"code"`
+	Command string `toon:"command"`
+}
+
 func branchSyncField(state branchsync.State) toON.Field {
 	local := []toON.Field{
 		{Key: "branch", Value: state.Local.Branch},
@@ -451,6 +533,9 @@ func branchSyncField(state branchsync.State) toON.Field {
 	if state.Recovered {
 		fields = append(fields, toON.Field{Key: "recovered", Value: true})
 	}
+	if state.Released {
+		fields = append(fields, toON.Field{Key: "released", Value: true})
+	}
 	fields = append(fields,
 		toON.Field{Key: "local", Value: toON.NewObject(local...)},
 		toON.Field{Key: "pipeline", Value: toON.NewObject(pipeline...)},
@@ -468,6 +553,13 @@ func branchSyncField(state branchsync.State) toON.Field {
 			toON.Field{Key: "code", Value: state.NextAction.Code},
 			toON.Field{Key: "command", Value: state.NextAction.Command},
 		)})
+	}
+	if len(state.Alternatives) > 0 {
+		alternatives := make([]nextActionRow, 0, len(state.Alternatives))
+		for _, action := range state.Alternatives {
+			alternatives = append(alternatives, nextActionRow{Code: action.Code, Command: action.Command})
+		}
+		fields = append(fields, toON.Field{Key: "alternatives", Value: alternatives})
 	}
 	return toON.Field{Key: "branch_sync", Value: toON.NewObject(fields...)}
 }

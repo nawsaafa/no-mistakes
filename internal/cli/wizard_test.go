@@ -460,6 +460,43 @@ func TestRunWizardTracksPageview(t *testing.T) {
 	}
 }
 
+// TestRunWizardPushContentPreservingRebaseUsesGuardedTriggerPush reproduces
+// the wizard-only trigger failure left after the AXI trigger was hardened: a
+// legitimate content-preserving rebase is not a fast-forward of the gate tip.
+// The wizard must replace that exact observed tip under a lease.
+func TestRunWizardPushContentPreservingRebaseUsesGuardedTriggerPush(t *testing.T) {
+	local, gateDir, _, rebasedHead := newTriggerRebaseFixture(t)
+	cliGit(t, local, "remote", "add", "no-mistakes", gateDir)
+
+	nmHome := makeSocketSafeTempDir(t)
+	t.Setenv("NM_HOME", nmHome)
+	p := paths.WithRoot(nmHome)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+
+	prevRun := wizardRun
+	wizardRun = func(cfg wizard.Config) (wizard.Result, error) {
+		if err := cfg.Push(context.Background(), "feature/rebase"); err != nil {
+			return wizard.Result{}, err
+		}
+		return wizard.Result{Success: true, Pushed: true, TargetBranch: "feature/rebase"}, nil
+	}
+	defer func() { wizardRun = prevRun }()
+
+	state := &repoState{
+		workDir:       local,
+		currentBranch: "feature/rebase",
+		defaultBranch: "main",
+	}
+	if _, err := runWizard(context.Background(), p, state, nil); err != nil {
+		t.Fatalf("wizard push after content-preserving rebase: %v", err)
+	}
+	if got := cliGit(t, gateDir, "rev-parse", "refs/heads/feature/rebase"); got != rebasedHead {
+		t.Fatalf("gate head = %s, want rebased %s", got, rebasedHead)
+	}
+}
+
 func TestRunWizardReturnsTerminalWizardError(t *testing.T) {
 	wantErr := errors.New("suggest branch: agent down")
 

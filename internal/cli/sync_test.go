@@ -356,6 +356,15 @@ type cliRecoverFixture struct {
 // operator worktree sits at the submitted head with no push binding.
 func newCLIRecoverFixture(t *testing.T) cliRecoverFixture {
 	t.Helper()
+	return newCLIRecoverFixtureWithVerifiedHead(t, true)
+}
+
+// newCLIRecoverFixtureWithVerifiedHead builds the same stranded custody state
+// with an explicit choice of terminal-head verification: verifiedHead false
+// models a legacy terminal row that reached its terminal status without
+// recording a verified preserved head.
+func newCLIRecoverFixtureWithVerifiedHead(t *testing.T, verifiedHead bool) cliRecoverFixture {
+	t.Helper()
 	nmHome := filepath.Join(t.TempDir(), "nm-home")
 	t.Setenv("NM_HOME", nmHome)
 	root := t.TempDir()
@@ -421,14 +430,18 @@ func newCLIRecoverFixture(t *testing.T) cliRecoverFixture {
 	if err := database.UpdateRunHeadSHA(run.ID, preserved); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.UpdateRunStatus(run.ID, types.RunCancelled); err != nil {
+	if verifiedHead {
+		if err := database.UpdateRunStatusWithVerifiedHead(run.ID, types.RunCancelled, preserved); err != nil {
+			t.Fatal(err)
+		}
+	} else if err := database.UpdateRunStatus(run.ID, types.RunCancelled); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
 	chdir(t, local)
-	return cliRecoverFixture{local: local, gate: gate, submitted: submitted, preserved: preserved}
+	return cliRecoverFixture{local: local, gate: gate, submitted: submitted, preserved: preserved, runID: run.ID}
 }
 
 // newCLIUnmovedAbortFixture reproduces the pre-push abort taken when delivery
@@ -894,6 +907,25 @@ func TestAxiSyncCheckSurfacesRecoveryForTerminalPrePushRun(t *testing.T) {
 	}
 }
 
+func TestAxiStatusSurfacesFreshRerunAlternativeForStrandedCustody(t *testing.T) {
+	newCLIRecoverFixture(t)
+	out, err := executeCmd("axi", "status")
+	if err != nil {
+		t.Fatalf("status: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"safety: blocked_pipeline_owned_recoverable",
+		"code: recover_custody",
+		"alternatives",
+		"rerun_pipeline",
+		"no-mistakes rerun",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status missing fresh-run alternative %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestAxiSyncRecoverReturnsCustodyEndToEnd(t *testing.T) {
 	f := newCLIRecoverFixture(t)
 	out, err := executeCmd("axi", "sync", "--recover")
@@ -915,6 +947,243 @@ func TestAxiSyncRecoverReturnsCustodyEndToEnd(t *testing.T) {
 	}
 	if !strings.Contains(out, "state: custody_returned") {
 		t.Fatalf("post-recover check:\n%s", out)
+	}
+}
+
+// TestAxiSyncReleaseBranchReleasesOnlyGateDivergedTerminalCustody covers the
+// explicit escape for a terminal run whose verified preserved head never
+// reached the gate branch. Ordinary recovery refuses first; release then stamps
+// the existing custody-return marker without moving either Git head.
+func TestAxiSyncReleaseBranchReleasesOnlyGateDivergedTerminalCustody(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+
+	out, err := executeCmd("axi", "sync", "--recover")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("gate-diverged recover should refuse, got %#v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"safety: blocked_recover_gate_diverged",
+		"code: rerun_pipeline",
+		"command: no-mistakes rerun",
+		"release_unreachable_custody",
+		"no-mistakes axi sync --release-branch",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("gate-diverged recovery missing %q:\n%s", want, out)
+		}
+	}
+
+	out, err = executeCmd("axi", "sync", "--release-branch")
+	if err != nil {
+		t.Fatalf("release unreachable branch custody: %v\n%s", err, out)
+	}
+	for _, want := range []string{"released: true", "state: custody_returned", "safety: custody_returned"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("release output missing %q:\n%s", want, out)
+		}
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("release moved local HEAD to %s", got)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("release moved gate head to %s", got)
+	}
+
+	p, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	run, err := database.GetRun(f.runID)
+	if err != nil || run == nil {
+		t.Fatalf("reload run: %#v, %v", run, err)
+	}
+	if run.CustodyReturnedAt == nil {
+		t.Fatal("release did not call SetRunCustodyReturned")
+	}
+}
+
+// TestHumanSyncReleaseBranchEscapesGateDivergedTerminalCustody proves the
+// interactive sync surface exposes the same guarded release as AXI. Recovery
+// must first refuse and name the human command; confirmation then stamps
+// custody returned without moving either Git head.
+func TestHumanSyncReleaseBranchEscapesGateDivergedTerminalCustody(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+
+	out, err := executeCmd("sync", "--recover", "--yes")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("gate-diverged human recover should refuse, got %#v\n%s", err, out)
+	}
+	if !strings.Contains(out, "no-mistakes sync --release-branch") {
+		t.Fatalf("human recovery refusal did not expose guarded release:\n%s", out)
+	}
+
+	previous := syncInteractive
+	syncInteractive = func() bool { return true }
+	t.Cleanup(func() { syncInteractive = previous })
+	cmd := newRootCmd()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetIn(strings.NewReader("yes\n"))
+	cmd.SetArgs([]string{"sync", "--release-branch"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("interactive release: %v\n%s", err, buf.String())
+	}
+	for _, want := range []string{"Release custody of this branch?", "Custody released"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("release output missing %q:\n%s", want, buf.String())
+		}
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("release moved local HEAD to %s", got)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("release moved gate head to %s", got)
+	}
+
+	p, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	run, err := database.GetRun(f.runID)
+	if err != nil || run == nil {
+		t.Fatalf("reload run: %#v, %v", run, err)
+	}
+	if run.CustodyReturnedAt == nil {
+		t.Fatal("human release did not stamp custody returned")
+	}
+}
+
+func TestAxiSyncReleaseBranchRefusesWhenRecoveryRemainsReachable(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	out, err := executeCmd("axi", "sync", "--release-branch")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("reachable recovery release should refuse, got %#v\n%s", err, out)
+	}
+	if !strings.Contains(out, "safety: blocked_release_recovery_available") || !strings.Contains(out, "no-mistakes axi sync --recover") {
+		t.Fatalf("reachable recovery refusal:\n%s", out)
+	}
+	p, _ := paths.New()
+	database, dbErr := db.Open(p.DB())
+	if dbErr != nil {
+		t.Fatal(dbErr)
+	}
+	defer database.Close()
+	run, getErr := database.GetRun(f.runID)
+	if getErr != nil || run == nil {
+		t.Fatalf("reload run: %#v, %v", run, getErr)
+	}
+	if run.CustodyReturnedAt != nil {
+		t.Fatal("reachable recovery release stamped custody")
+	}
+}
+
+func TestAxiSyncReleaseBranchRefusesActiveRun(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+	p, _ := paths.New()
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(f.runID, types.RunRunning); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := executeCmd("axi", "sync", "--release-branch")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("active-run release should refuse, got %#v\n%s", err, out)
+	}
+	if !strings.Contains(out, "safety: blocked_release_run_active") {
+		t.Fatalf("active-run release refusal:\n%s", out)
+	}
+}
+
+// TestAxiSyncReleaseBranchRefusesUnverifiedTerminalHead keeps the release
+// escape unavailable to a terminal row whose preserved head was never
+// verified: without that proof the run's recorded head is not trustworthy
+// evidence that recovery is unreachable, so custody must stay held.
+func TestAxiSyncReleaseBranchRefusesUnverifiedTerminalHead(t *testing.T) {
+	f := newCLIRecoverFixtureWithVerifiedHead(t, false)
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted, f.preserved)
+
+	out, err := executeCmd("axi", "sync", "--release-branch")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("unverified-head release should refuse, got %#v\n%s", err, out)
+	}
+	if !strings.Contains(out, "safety: blocked_release_unverified_head") {
+		t.Fatalf("unverified-head release refusal:\n%s", out)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("refusal moved gate head to %s", got)
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("refusal moved local HEAD to %s", got)
+	}
+	assertCustodyNotReturned(t, f.runID)
+}
+
+// TestAxiSyncReleaseBranchRefusesWithoutReadableGate keeps the release escape
+// unavailable when the local gate cannot be read: gate divergence is the only
+// proof that guarded recovery is unreachable, so a missing gate fails closed.
+func TestAxiSyncReleaseBranchRefusesWithoutReadableGate(t *testing.T) {
+	f := newCLIRecoverFixture(t)
+	if err := os.RemoveAll(f.gate); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := executeCmd("axi", "sync", "--release-branch")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("missing-gate release should refuse, got %#v\n%s", err, out)
+	}
+	if !strings.Contains(out, "safety: blocked_release_gate_unavailable") {
+		t.Fatalf("missing-gate release refusal:\n%s", out)
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("refusal moved local HEAD to %s", got)
+	}
+	assertCustodyNotReturned(t, f.runID)
+}
+
+func assertCustodyNotReturned(t *testing.T, runID string) {
+	t.Helper()
+	p, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	run, err := database.GetRun(runID)
+	if err != nil || run == nil {
+		t.Fatalf("reload run: %#v, %v", run, err)
+	}
+	if run.CustodyReturnedAt != nil {
+		t.Fatal("refused release stamped custody returned")
 	}
 }
 
@@ -958,8 +1227,12 @@ func TestSyncRecoverFlagValidation(t *testing.T) {
 	for _, args := range [][]string{
 		{"sync", "--check", "--recover"},
 		{"sync", "--keep-local"},
+		{"sync", "--check", "--release-branch"},
+		{"sync", "--recover", "--release-branch"},
 		{"axi", "sync", "--check", "--recover"},
 		{"axi", "sync", "--keep-local"},
+		{"axi", "sync", "--check", "--release-branch"},
+		{"axi", "sync", "--recover", "--release-branch"},
 	} {
 		out, err := executeCmd(args...)
 		var ee *exitError

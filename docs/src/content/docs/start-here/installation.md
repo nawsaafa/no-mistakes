@@ -88,7 +88,7 @@ Background update checks run automatically on each CLI invocation (except `updat
 no-mistakes eject
 ```
 
-Removes the `no-mistakes` remote, deletes the bare repo, cleans up worktrees, and removes the database record.
+Git remains the sole custody authority for no-mistakes, so this command never deletes anything: it reports the gate's on-disk paths and database record, and prints the manual steps to remove them yourself.
 It does not remove repo-local agent skill files created by `no-mistakes init`.
 
 ## Uninstall

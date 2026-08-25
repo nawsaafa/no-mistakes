@@ -297,7 +297,7 @@ func TestExecutor_TracksApprovalAndUserFixTelemetry(t *testing.T) {
 		fn: func(sctx *StepContext) (*StepOutcome, error) {
 			callCount++
 			if callCount == 1 {
-				return &StepOutcome{NeedsApproval: true, Findings: `{"findings":[{"severity":"error","description":"bug one","action":"auto-fix"},{"severity":"warn","description":"bug two","action":"ask-user"}],"summary":"2 issues"}`}, nil
+				return &StepOutcome{NeedsApproval: true, Findings: `{"findings":[{"id":"review-1","severity":"error","description":"bug one","action":"auto-fix"},{"id":"review-2","severity":"warn","description":"bug two","action":"ask-user"}],"summary":"2 issues"}`}, nil
 			}
 			return &StepOutcome{ExitCode: 0}, nil
 		},
@@ -312,7 +312,7 @@ func TestExecutor_TracksApprovalAndUserFixTelemetry(t *testing.T) {
 
 	waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
 
-	if err := exec.Respond(types.StepReview, types.ActionFix, nil); err != nil {
+	if err := exec.Respond(types.StepReview, types.ActionFix, []string{"review-1", "review-2"}); err != nil {
 		t.Fatalf("respond error: %v", err)
 	}
 
@@ -354,6 +354,125 @@ func TestExecutor_TracksApprovalAndUserFixTelemetry(t *testing.T) {
 	if got := stepEvent.fields["agent"]; got != string(types.AgentClaude) {
 		t.Fatalf("step agent = %v, want %q", got, types.AgentClaude)
 	}
+}
+
+func TestExecutor_ApprovalTelemetryReportsDispatchedCountForUserFix(t *testing.T) {
+	parkedFindings := `{"findings":[` +
+		`{"id":"review-1","severity":"error","description":"first","action":"auto-fix"},` +
+		`{"id":"review-2","severity":"error","description":"second","action":"auto-fix"},` +
+		`{"id":"review-3","severity":"error","description":"third","action":"auto-fix"}` +
+		`],"summary":"3 findings"}`
+
+	t.Run("fix with only an added finding reports zero", func(t *testing.T) {
+		database, p, run, repo := setupTest(t)
+		workDir := t.TempDir()
+
+		recorder := &telemetryRecorder{}
+		restore := telemetry.SetDefaultForTesting(recorder)
+		defer restore()
+
+		calls := 0
+		step := &adaptiveCallStep{
+			name: types.StepReview,
+			fn: func(sctx *StepContext) (*StepOutcome, error) {
+				calls++
+				if calls == 1 {
+					return &StepOutcome{NeedsApproval: true, Findings: parkedFindings}, nil
+				}
+				return &StepOutcome{}, nil
+			},
+		}
+
+		exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+		done := make(chan error, 1)
+		go func() {
+			done <- exec.Execute(context.Background(), run, repo, workDir)
+		}()
+
+		waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+		if err := exec.RespondWithOverrides(
+			types.StepReview,
+			types.ActionFix,
+			nil,
+			nil,
+			[]types.Finding{{Severity: "warning", Description: "operator finding", Action: types.ActionAutoFix}},
+		); err != nil {
+			t.Fatalf("respond error: %v", err)
+		}
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("executor timed out")
+		}
+
+		approvalEvent := recorder.find("approval", "action", "fix")
+		if approvalEvent == nil {
+			t.Fatal("expected approval telemetry event")
+		}
+		if got := approvalEvent.fields["selected_findings_count"]; fmt.Sprint(got) != "0" {
+			t.Fatalf("approval selected_findings_count = %v, want 0 dispatched gate findings", got)
+		}
+		fixEvent := recorder.find("fix", "source", "user")
+		if fixEvent == nil {
+			t.Fatal("expected user fix telemetry event")
+		}
+		if got := fixEvent.fields["selected_findings_count"]; fmt.Sprint(got) != "0" {
+			t.Fatalf("fix selected_findings_count = %v, want 0", got)
+		}
+	})
+
+	t.Run("approve still reports the round total", func(t *testing.T) {
+		database, p, run, repo := setupTest(t)
+		workDir := t.TempDir()
+
+		recorder := &telemetryRecorder{}
+		restore := telemetry.SetDefaultForTesting(recorder)
+		defer restore()
+
+		calls := 0
+		step := &adaptiveCallStep{
+			name: types.StepReview,
+			fn: func(sctx *StepContext) (*StepOutcome, error) {
+				calls++
+				if calls == 1 {
+					return &StepOutcome{NeedsApproval: true, Findings: parkedFindings}, nil
+				}
+				return &StepOutcome{}, nil
+			},
+		}
+
+		exec := NewExecutor(database, p, nil, nil, []Step{step}, nil)
+		done := make(chan error, 1)
+		go func() {
+			done <- exec.Execute(context.Background(), run, repo, workDir)
+		}()
+
+		waitForStepStatus(t, database, run.ID, types.StepReview, types.StepStatusAwaitingApproval)
+		if err := exec.Respond(types.StepReview, types.ActionApprove, nil); err != nil {
+			t.Fatalf("respond error: %v", err)
+		}
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("execute: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("executor timed out")
+		}
+
+		approvalEvent := recorder.find("approval", "action", "approve")
+		if approvalEvent == nil {
+			t.Fatal("expected approval telemetry event")
+		}
+		if got := approvalEvent.fields["selected_findings_count"]; fmt.Sprint(got) != "3" {
+			t.Fatalf("approve selected_findings_count = %v, want the round total 3", got)
+		}
+	})
 }
 
 func TestExecutor_TracksAutoFixTelemetry(t *testing.T) {

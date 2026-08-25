@@ -72,6 +72,8 @@ Always shown. Asks whether to push the current branch to the `no-mistakes` gate.
 - Press `y` to push.
 - Press `n` to stop.
 
+The wizard pushes the exact committed head under the same guarded gate-tip discipline as [`no-mistakes axi run`](/no-mistakes/reference/cli/#no-mistakes-axi-run), so a branch you rebased locally between runs still pushes, while a concurrent or unrelated gate write refuses.
+
 If the push succeeds, the interactive wizard stays visible in a brief `waiting for run…` state while the daemon registers the new run, then hands off to the main TUI and attaches. If no run appears in time, the wizard exits with an error instead of silently falling through, and points you at the gate's `notify-push.log` for hook diagnostics.
 
 The goal is to keep the setup path short. If you already have a branch, it does

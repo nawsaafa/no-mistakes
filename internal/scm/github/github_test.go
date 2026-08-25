@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +93,109 @@ func TestHostPrefixedSlugForHost_SSHAlias(t *testing.T) {
 	}
 	if got := HostPrefixedSlugForHost(remote, "ghe.example.com"); got != "ghe.example.com/owner/repo" {
 		t.Fatalf("HostPrefixedSlugForHost() = %q, want ghe.example.com/owner/repo", got)
+	}
+}
+
+func TestGetChecksInDetachedBareRepoTargetsTheKnownPR(t *testing.T) {
+	bare := t.TempDir()
+	cmd := exec.Command("git", "init", "--bare", bare)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("init bare repo: %v: %s", err, out)
+	}
+	binDir := t.TempDir()
+	fakeGh := filepath.Join(binDir, "gh")
+	if err := os.WriteFile(fakeGh, []byte(`#!/bin/sh
+case " $* " in
+  *" pr checks 123 "*) printf '%s\n' '[{"name":"build","state":"SUCCESS","bucket":"pass"}]' ;;
+  *) printf '%s\n' '[]' ;;
+esac
+`), 0o755); err != nil {
+		t.Fatalf("write fake gh: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	host := New(func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		command := exec.CommandContext(ctx, name, args...)
+		command.Dir = bare
+		return command
+	}, nil, "", "test/repo")
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
+	if err != nil {
+		t.Fatalf("GetChecks() from detached bare repo: %v", err)
+	}
+	if len(checks) != 1 || checks[0].Name != "build" || checks[0].Bucket != scm.CheckBucketPass {
+		t.Fatalf("checks = %+v, want the known PR's passing build check", checks)
+	}
+}
+
+// GitHub's statusCheckRollup exposes CheckRun conclusions and StatusContext
+// state through different union members. The `gh pr checks` projection is the
+// provider's own normalized view and must be used so third-party commit status
+// contexts (for example CodeRabbit and Vercel) cannot disappear as pending.
+func TestGetChecksUsesNormalizedPRChecksForStatusContexts(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr checks 123 --repo test/repo --json name,state,bucket,completedAt,link": {
+			stdout: `[
+				{"name":"CodeRabbit","state":"SUCCESS","bucket":"pass","link":"https://example.test/coderabbit"},
+				{"name":"Vercel","state":"SUCCESS","bucket":"pass","link":"https://example.test/vercel"},
+				{"name":"build","state":"SUCCESS","bucket":"pass","completedAt":"2026-08-24T00:00:00Z"}
+			]` + "\n",
+		},
+	}), nil, "", "test/repo")
+
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
+	if err != nil {
+		t.Fatalf("GetChecks() error = %v", err)
+	}
+	if len(checks) != 3 {
+		t.Fatalf("checks = %+v, want normalized status contexts and check run", checks)
+	}
+	for _, check := range checks {
+		if check.Bucket != scm.CheckBucketPass {
+			t.Errorf("check %q bucket = %q, want pass", check.Name, check.Bucket)
+		}
+	}
+}
+
+func TestGetChecksReadsPendingChecksFromNonZeroExit(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr checks 123 --json name,state,bucket,completedAt,link": {
+			stdout: `[{"name":"build","state":"PENDING","bucket":"pending"}]` + "\n",
+			stderr: "checks are still pending\n",
+			code:   8,
+		},
+	}), nil, "", "")
+
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
+	if err != nil {
+		t.Fatalf("GetChecks() pending non-zero exit error = %v", err)
+	}
+	if len(checks) != 1 || checks[0].Bucket != scm.CheckBucketPending {
+		t.Fatalf("checks = %+v, want one pending check and no reader error", checks)
+	}
+}
+
+func TestGetChecksReadsFailingChecksFromNonZeroExit(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr checks 123 --json name,state,bucket,completedAt,link": {
+			stdout: `[{"name":"build","state":"FAILURE","bucket":"fail"}]` + "\n",
+			stderr: "checks failed\n",
+			code:   1,
+		},
+	}), nil, "", "")
+
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "123"})
+	if err != nil {
+		t.Fatalf("GetChecks() failing non-zero exit error = %v", err)
+	}
+	if len(checks) != 1 || checks[0].Bucket != scm.CheckBucketFail {
+		t.Fatalf("checks = %+v, want one failing check and no reader error", checks)
 	}
 }
 
@@ -224,7 +329,7 @@ func TestGetChecksFallsBackToStateWhenBucketMissing(t *testing.T) {
 
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
 		"gh pr checks 123 --json name,state,bucket,completedAt,link": {
-			stdout: `[{"name":"build","state":"FAILURE","bucket":""},{"name":"tests","state":"PENDING","bucket":""}]` + "\n",
+			stdout: `[{"name":"build","state":"FAILURE","bucket":"fail"},{"name":"tests","state":"PENDING","bucket":"pending"}]` + "\n",
 		},
 	}), nil, "", "")
 
@@ -298,12 +403,15 @@ func TestGetChecksTargetsKnownPRByURLWhenNumberMissing(t *testing.T) {
 	}
 	got := recorded[0]
 	// argv is: gh pr checks <selector> --repo ...
-	if len(got) < 4 || got[1] != "pr" || got[2] != "checks" {
+	if len(got) < 6 || got[1] != "pr" || got[2] != "checks" {
 		t.Fatalf("unexpected argv: %v", got)
 	}
 	selector := got[3]
 	if selector != prURL {
 		t.Fatalf("check selector = %q, want the known PR URL %q (empty selector makes gh resolve the cwd branch)", selector, prURL)
+	}
+	if got[4] != "--repo" || got[5] != "test/repo" {
+		t.Fatalf("check repository scope = %v, want --repo test/repo", got)
 	}
 }
 
@@ -358,8 +466,11 @@ func TestPRStateAndMergeableTargetKnownPRByURL(t *testing.T) {
 	if _, err := stateHost.GetPRState(context.Background(), &scm.PR{URL: prURL}); err != nil {
 		t.Fatalf("GetPRState() error = %v", err)
 	}
-	if len(stateArgs) != 1 || len(stateArgs[0]) < 4 || stateArgs[0][3] != prURL {
+	if len(stateArgs) != 1 || len(stateArgs[0]) < 6 || stateArgs[0][3] != prURL {
 		t.Fatalf("GetPRState selector = %v, want %q at argv[3]", stateArgs, prURL)
+	}
+	if stateArgs[0][4] != "--repo" || stateArgs[0][5] != "test/repo" {
+		t.Fatalf("GetPRState repository scope = %v, want --repo test/repo", stateArgs)
 	}
 
 	var mergeArgs [][]string
@@ -367,8 +478,11 @@ func TestPRStateAndMergeableTargetKnownPRByURL(t *testing.T) {
 	if _, err := mergeHost.GetMergeableState(context.Background(), &scm.PR{URL: prURL}); err != nil {
 		t.Fatalf("GetMergeableState() error = %v", err)
 	}
-	if len(mergeArgs) != 1 || len(mergeArgs[0]) < 4 || mergeArgs[0][3] != prURL {
+	if len(mergeArgs) != 1 || len(mergeArgs[0]) < 6 || mergeArgs[0][3] != prURL {
 		t.Fatalf("GetMergeableState selector = %v, want %q at argv[3]", mergeArgs, prURL)
+	}
+	if mergeArgs[0][4] != "--repo" || mergeArgs[0][5] != "test/repo" {
+		t.Fatalf("GetMergeableState repository scope = %v, want --repo test/repo", mergeArgs)
 	}
 }
 
@@ -404,7 +518,7 @@ func TestGetChecksParsesStateAndLink(t *testing.T) {
 	const link = "https://github.com/test/repo/actions/runs/900/job/901"
 	host := New(githubTestCmdFactory(map[string]githubTestResponse{
 		"gh pr checks 123 --json name,state,bucket,completedAt,link": {
-			stdout: `[{"name":"build","state":"cancelled","bucket":"cancel","link":"` + link + `"}]` + "\n",
+			stdout: `[{"name":"build","state":"CANCELLED","bucket":"cancel","link":"` + link + `"}]` + "\n",
 		},
 	}), nil, "", "")
 
@@ -423,6 +537,74 @@ func TestGetChecksParsesStateAndLink(t *testing.T) {
 	}
 	if checks[0].Link != link {
 		t.Fatalf("checks[0].Link = %q, want %q", checks[0].Link, link)
+	}
+}
+
+func TestGetChecksMapsNormalizedBuckets(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr checks 58 --json name,state,bucket,completedAt,link": {
+			stdout: `[
+				{"name":"pass","state":"SUCCESS","bucket":"pass"},
+				{"name":"fail","state":"FAILURE","bucket":"fail"},
+				{"name":"pending","state":"PENDING","bucket":"pending"},
+				{"name":"skip","state":"SKIPPED","bucket":"skipping"},
+				{"name":"third-party","state":"SUCCESS","bucket":"pass","link":"https://example.test/check"}
+			]` + "\n",
+		},
+	}), nil, "", "")
+
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "58"})
+	if err != nil {
+		t.Fatalf("GetChecks() error = %v", err)
+	}
+	want := map[string]scm.CheckBucket{
+		"pass": scm.CheckBucketPass, "fail": scm.CheckBucketFail,
+		"pending": scm.CheckBucketPending, "skip": scm.CheckBucketSkip,
+		"third-party": scm.CheckBucketPass,
+	}
+	if len(checks) != len(want) {
+		t.Fatalf("len(checks) = %d, want %d: %+v", len(checks), len(want), checks)
+	}
+	for _, check := range checks {
+		if check.Bucket != want[check.Name] {
+			t.Errorf("check %q bucket = %q, want %q", check.Name, check.Bucket, want[check.Name])
+		}
+	}
+}
+
+func TestGetChecksZeroNormalizedChecksIsEmpty(t *testing.T) {
+	t.Parallel()
+
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr checks 58 --json name,state,bucket,completedAt,link": {stdout: `[]` + "\n"},
+	}), nil, "", "")
+	checks, err := host.GetChecks(context.Background(), &scm.PR{Number: "58"})
+	if err != nil || len(checks) != 0 {
+		t.Fatalf("GetChecks() = %+v, %v, want zero checks", checks, err)
+	}
+}
+
+func TestGetChecksBoundsAndRedactsFailureOutput(t *testing.T) {
+	t.Parallel()
+
+	const token = "secret-token"
+	output := "https://user:" + token + "@github.example.test/org/repo " + strings.Repeat("x", maxGitHubCommandOutput+500)
+	host := New(githubTestCmdFactory(map[string]githubTestResponse{
+		"gh pr checks 58 --json name,state,bucket,completedAt,link": {stderr: output, code: 1},
+	}), nil, "", "")
+
+	_, err := host.GetChecks(context.Background(), &scm.PR{Number: "58"})
+	if err == nil {
+		t.Fatal("GetChecks() error = nil, want CLI error")
+	}
+	message := err.Error()
+	if strings.Contains(message, token) || strings.Contains(message, "https://user:") {
+		t.Fatalf("GetChecks() leaked credential: %q", message)
+	}
+	if !strings.Contains(message, "...[truncated]") {
+		t.Fatalf("GetChecks() failure was not bounded: %q", message)
 	}
 }
 
@@ -742,7 +924,11 @@ func TestGitHubHelperProcess(t *testing.T) {
 		os.Exit(1)
 	}
 	if code := os.Getenv("GITHUB_TEST_EXIT_CODE"); code != "" && code != "0" {
-		os.Exit(1)
+		exitCode, err := strconv.Atoi(code)
+		if err != nil {
+			exitCode = 1
+		}
+		os.Exit(exitCode)
 	}
 	os.Exit(0)
 }

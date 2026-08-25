@@ -4,12 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
 
 func runCodex(args []string, scenario *Scenario) int {
-	prompt := extractCodexPrompt(args)
+	prompt, err := readCodexPrompt(args, os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "fakeagent: codex prompt: %v\n", err)
+		return 1
+	}
 	logInvocation("codex", prompt, args)
 
 	action := scenario.Match(prompt)
@@ -172,11 +177,25 @@ func filterStructuredToSchema(structured map[string]any, schemaPath string) (map
 	return filtered, nil
 }
 
+// readCodexPrompt resolves codex's prompt positional and reads stdin when the
+// adapter uses codex's documented `-` prompt marker.
+func readCodexPrompt(args []string, stdin io.Reader) (string, error) {
+	prompt := extractCodexPrompt(args)
+	if prompt != "-" {
+		return prompt, nil
+	}
+	data, err := io.ReadAll(stdin)
+	if err != nil {
+		return "", fmt.Errorf("read stdin: %w", err)
+	}
+	return string(data), nil
+}
+
 // extractCodexPrompt finds the prompt positional. Real codex argv is
 // `codex exec [user-flags...] <prompt> --json [...]` for a fresh session and
 // `codex exec resume [user-flags...] <session-id> <prompt> --json [...]` for
 // a session-resume turn, so on resume the prompt is the positional after the
-// session id.
+// session id. The prompt may be `-`, which readCodexPrompt resolves from stdin.
 func extractCodexPrompt(args []string) string {
 	flagsWithValues := map[string]bool{
 		"-m": true, "--model": true,
@@ -198,6 +217,10 @@ func extractCodexPrompt(args []string) string {
 		a := args[i]
 		if flagsWithValues[a] {
 			i++
+			continue
+		}
+		if a == "-" {
+			positionals = append(positionals, a)
 			continue
 		}
 		if len(a) > 0 && a[0] == '-' {

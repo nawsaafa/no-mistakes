@@ -278,48 +278,31 @@ func reattachRelocatedRepo(ctx context.Context, d *db.DB, p *paths.Paths, absRoo
 	return migrated, nil
 }
 
-// Eject removes the no-mistakes gate from the repo at workDir.
-// It removes the remote, deletes the bare repo and worktrees,
-// and deletes the repo record from the database.
+// Eject reports the on-disk and database state of the no-mistakes gate for
+// the repo at workDir. It is read-only: Git remains the sole custody
+// authority, so no-mistakes never deletes a bare gate repo, its worktrees,
+// its remote, or its database record on its own. Removing a gate is a
+// manual, deliberate operation left to the operator.
 func Eject(ctx context.Context, d *db.DB, p *paths.Paths, workDir string) (*db.Repo, error) {
 	if classified, err := (gatecontext.Inspector{DB: d, Paths: p}).Inspect(ctx, gatecontext.Request{CWD: workDir, MarkerPresent: gatecontext.MarkerPresent()}); err != nil {
 		return nil, err
 	} else if classified.Nested {
 		return nil, fmt.Errorf("%s", gatecontext.RefusalMessage(classified))
 	}
-	// Normalize worktrees back to the main repo root so eject works no matter
+	// Normalize worktrees back to the main repo root so this works no matter
 	// which checkout the user runs it from.
 	gitRoot, err := git.FindMainRepoRoot(workDir)
 	if err != nil {
 		return nil, fmt.Errorf("find git root: %w", err)
 	}
-	absRoot := gitRoot
 
-	// Look up repo in DB.
-	repo, err := d.GetRepoByPath(absRoot)
+	repo, err := d.GetRepoByPath(gitRoot)
 	if err != nil {
 		return nil, fmt.Errorf("get repo: %w", err)
 	}
 	if repo == nil {
-		return nil, fmt.Errorf("not initialized for %s", absRoot)
+		return nil, fmt.Errorf("not initialized for %s", gitRoot)
 	}
 
-	// Remove remote from working repo (non-fatal).
-	_ = git.RemoveRemote(ctx, absRoot, RemoteName)
-
-	// Delete bare repo.
-	bareDir := p.RepoDir(repo.ID)
-	os.RemoveAll(bareDir)
-
-	// Delete worktrees for this repo.
-	repoWtDir := filepath.Join(p.WorktreesDir(), repo.ID)
-	os.RemoveAll(repoWtDir)
-
-	// Delete repo record (cascades to runs + steps).
-	if err := d.DeleteRepo(repo.ID); err != nil {
-		return nil, fmt.Errorf("delete repo record: %w", err)
-	}
-
-	slog.Info("gate ejected", "repo_id", repo.ID, "path", absRoot)
 	return repo, nil
 }

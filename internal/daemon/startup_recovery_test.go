@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"os"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
+	"github.com/kunchenguid/no-mistakes/internal/git"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -36,11 +38,10 @@ func TestRecoverOnStartup_DoesNotDeleteActiveRunWorktree(t *testing.T) {
 	}
 	defer d.Close()
 
-	repo, err := d.InsertRepoWithID("repo1", "/nonexistent/work", "https://example.com/owner/repo1", "main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	activeRun, err := d.InsertRun(repo.ID, "feature", "headsha", "basesha")
+	ctx := context.Background()
+	repo, headSHA := setupTestGitRepo(t, p, d, "repo1")
+
+	activeRun, err := d.InsertRun(repo.ID, "feature", headSHA, headSHA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,15 +50,12 @@ func TestRecoverOnStartup_DoesNotDeleteActiveRunWorktree(t *testing.T) {
 	}
 
 	activeWT := p.WorktreeDir(repo.ID, activeRun.ID)
-	if err := os.MkdirAll(activeWT, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(activeWT+"/marker", []byte("still running"), 0o644); err != nil {
+	if err := git.WorktreeAdd(ctx, p.RepoDir(repo.ID), activeWT, headSHA); err != nil {
 		t.Fatal(err)
 	}
 
 	// A terminal run's worktree, for contrast: cleanup should remove this one.
-	terminalRun, err := d.InsertRun(repo.ID, "old-branch", "headsha2", "basesha2")
+	terminalRun, err := d.InsertRun(repo.ID, "old-branch", headSHA, headSHA)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +63,7 @@ func TestRecoverOnStartup_DoesNotDeleteActiveRunWorktree(t *testing.T) {
 		t.Fatal(err)
 	}
 	terminalWT := p.WorktreeDir(repo.ID, terminalRun.ID)
-	if err := os.MkdirAll(terminalWT, 0o755); err != nil {
+	if err := git.WorktreeAdd(ctx, p.RepoDir(repo.ID), terminalWT, headSHA); err != nil {
 		t.Fatal(err)
 	}
 

@@ -287,6 +287,48 @@ func freshRunBranchOwnershipState(ctx context.Context, env *axiEnv) *branchsync.
 	}
 }
 
+type triggerPushPlan struct {
+	headSHA        string
+	expectedSHA    string
+	forceWithLease bool
+}
+
+// planTriggerPush permits a non-fast-forward gate update only when the local
+// head content-exactly carries every change from the currently observed gate
+// tip. The exact observation becomes the force-with-lease anchor, so any write
+// after this read makes the push fail rather than discarding concurrent work.
+func planTriggerPush(ctx context.Context, dir, remote, ref, headSHA string) (triggerPushPlan, error) {
+	observed, err := git.LsRemote(ctx, dir, remote, ref)
+	if err != nil {
+		return triggerPushPlan{}, fmt.Errorf("observe gate branch %s: %w", ref, err)
+	}
+	plan := triggerPushPlan{headSHA: headSHA}
+	if observed == "" || observed == headSHA {
+		return plan, nil
+	}
+	if _, err := git.Run(ctx, dir, "merge-base", "--is-ancestor", observed, headSHA); err == nil {
+		return plan, nil
+	}
+	if !branchsync.ContainsAllChanges(ctx, dir, observed, headSHA) {
+		return plan, nil
+	}
+	plan.expectedSHA = observed
+	plan.forceWithLease = true
+	return plan, nil
+}
+
+func executeTriggerPush(ctx context.Context, dir, remote, ref string, plan triggerPushPlan, pushOptions []string) error {
+	return git.PushCommitWithOptions(ctx, dir, remote, plan.headSHA, ref, plan.expectedSHA, plan.forceWithLease, pushOptions)
+}
+
+func pushTriggerHead(ctx context.Context, dir, remote, ref, headSHA string, pushOptions []string) error {
+	plan, err := planTriggerPush(ctx, dir, remote, ref, headSHA)
+	if err != nil {
+		return err
+	}
+	return executeTriggerPush(ctx, dir, remote, ref, plan, pushOptions)
+}
+
 // triggerRun starts a fresh run for branch: it pushes the current HEAD through
 // the gate to trigger a pipeline, and falls back to a rerun when the push was a
 // no-op (the gate already had this commit). Callers must check for an existing
@@ -305,7 +347,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 	if state := freshRunBranchOwnershipState(ctx, env); state != nil {
 		return "", &branchOwnershipError{state: *state}
 	}
-	pushErr := git.PushWithOptions(ctx, ".", gate.RemoteName, "refs/heads/"+branch, "", false, pushOptions)
+	pushErr := pushTriggerHead(ctx, ".", gate.RemoteName, "refs/heads/"+branch, headSHA, pushOptions)
 	if pushErr != nil {
 		// Close the inspection-to-push race: if the pipeline advanced ownership
 		// after the pre-push check, preserve the structured branch-sync refusal
@@ -827,6 +869,71 @@ func gateStatusFor(rv runView, step string) string {
 		}
 	}
 	return string(types.StepStatusAwaitingApproval)
+}
+
+func newAxiCICloseCmd() *cobra.Command {
+	var runID, what, suppliedBy string
+	cmd := &cobra.Command{
+		Use:           "ci-close",
+		Short:         "Close a running CI monitor with external forge evidence",
+		Long:          "Closes only a currently running CI step. The supplied evidence and its supplier are persisted with the step; both are required, so this command cannot assert an unsubstantiated green result. Use --run from any worktree when a supervisor is recovering a blind monitor.",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return trackAxiSurface("axi-ci-close", "/axi/ci-close", nil, func() error {
+				return runAxiCIClose(cmd, runID, what, suppliedBy)
+			})
+		},
+	}
+	cmd.Flags().StringVar(&runID, "run", "", "running CI monitor run id (required)")
+	cmd.Flags().StringVar(&what, "evidence", "", "what the external forge showed (required)")
+	cmd.Flags().StringVar(&suppliedBy, "evidence-by", "", "who independently supplied or verified the evidence (required)")
+	return cmd
+}
+
+func runAxiCIClose(cmd *cobra.Command, runID, what, suppliedBy string) error {
+	runID = strings.TrimSpace(runID)
+	what = strings.TrimSpace(what)
+	suppliedBy = strings.TrimSpace(suppliedBy)
+	if runID == "" || what == "" || suppliedBy == "" {
+		return emitError(cmd, 2, "--run, --evidence, and --evidence-by are required", "Example: no-mistakes axi ci-close --run <id> --evidence \"GitHub checks green at <sha>\" --evidence-by \"supervisor\"")
+	}
+	env, err := openAxiExplicitRunDaemonEnv(runID)
+	if err != nil {
+		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
+	}
+	defer env.close()
+
+	if err := sendCIClose(env.client, runID, what, suppliedBy); err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("close CI monitor: %v", err))
+	}
+	if err := waitStepLeavesGate(cmd.Context(), env.p.Socket(), runID, string(types.StepCI), string(types.StepStatusRunning)); err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("wait for CI close: %v", err))
+	}
+	final, err := getRunInfo(env.client, runID)
+	if err != nil {
+		return emitError(cmd, 1, fmt.Sprintf("load closed run: %v", err))
+	}
+	emitDoc(cmd,
+		toon.Field{Key: "ci_closed", Value: true},
+		toon.Field{Key: "evidence", Value: what},
+		toon.Field{Key: "evidence_by", Value: suppliedBy},
+		toon.Field{Key: "run", Value: runID},
+		toon.Field{Key: "run_status", Value: string(final.Status)},
+	)
+	return nil
+}
+
+func sendCIClose(client *ipc.Client, runID, what, suppliedBy string) error {
+	var result ipc.CloseCIResult
+	if err := client.Call(ipc.MethodCloseCI, &ipc.CloseCIParams{RunID: runID, What: what, SuppliedBy: suppliedBy}, &result); err != nil {
+		return err
+	}
+	if !result.OK {
+		return fmt.Errorf("daemon rejected the CI close")
+	}
+	return nil
 }
 
 func newAxiAbortCmd() *cobra.Command {
